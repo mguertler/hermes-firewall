@@ -75,8 +75,10 @@ is 24 hours (or less, see `lease.max` below). Opening again restarts the time.
 
 In a chat of a protected profile, `/firewall` does the same for that profile:
 `/firewall open`, `/firewall open lan 30m`, `/firewall close`, `/firewall status`.
-It works when typed on every platform. Telegram's `/` menu holds only 60 commands and
-Hermes' own fill it; to list `/firewall` there too:
+It works when typed on every platform and shows up in the desktop app's command search
+and Telegram's inline search (`@yourbot firewall`). Hermes' `/help` and `/commands` list
+only built-in and skill commands, no plugin commands. Telegram's `/` menu holds only 60
+commands and Hermes' own fill it; to list `/firewall` there too:
 `hermes -p PROFILE config set platforms.telegram.extra.command_menu.priority '["firewall"]'`
 and restart the gateway.
 
