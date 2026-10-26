@@ -69,4 +69,5 @@ Not covered automatically; record the result (distribution, versions, date) belo
 | Date | What | Where | Result |
 |---|---|---|---|
 | 2026-10-26 | unit tests, netns.sh (nft 1.1.3), shellcheck | Debian 13, Python 3.13 | pass |
+| 2026-10-26 | independent code review (12 findings), fixes, re-run of all tests | Debian 13 | pass |
 | | live test, manual checks 1-8 | | **not done yet** |

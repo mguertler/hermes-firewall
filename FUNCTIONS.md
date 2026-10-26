@@ -34,10 +34,11 @@ functions are added, removed or change their job. Architecture: [ARCHITECTURE.md
 | `resolve(host, servers, qtype)` | Ask the sandbox DNS servers (UDP, IPv4 or IPv6). |
 | `resolve_host(host, servers)` | A + AAAA of a LAN host name. |
 | `nat64_prefixes(servers)` | Well-known NAT64 prefix plus DNS64-announced ones (`ipv4only.arpa`). |
-| `host_networks()` | Networks the host is directly connected to (for `lan.networks = ["auto"]`). |
+| `host_networks()` | Networks the host is directly connected to: addresses and on-link routes (for `lan.networks = ["auto"]`). |
 | `docker_gateway()` | IPv4 address of docker0 (`host.docker.internal`). |
 | `proxy_ports(conf)` | `{uid: [elements]}` of iron-proxy listeners on docker0. |
-| `common_sets(conf, strict)` | Set elements shared by all profiles; `strict` fails on unresolvable hosts. |
+| `load_cache()` | Last resolved `lan.hosts` addresses and DNS64 prefixes (`resolved.json`). |
+| `common_sets(conf, strict)` | Set elements shared by all profiles; `strict` fails on unresolvable names, otherwise the cache is used; collapses overlapping `[[allow]]` networks. |
 | `profile_sets(record, common, proxies)` | Add the egress-proxy ports of the profile's user. |
 
 ## nftables
@@ -59,7 +60,7 @@ functions are added, removed or change their job. Architecture: [ARCHITECTURE.md
 | `trusted(path)` | Refuse symlinks and files not owned by root or writable by others. |
 | `validate_registry(data)` / `load_registry()` / `save_registry(data)` | Registry `profiles.json`. |
 | `atomic_write(path, data, mode)` | Write via temporary file, fsync, rename. |
-| `run(*arguments)` | Run a system command with a fixed environment; raise on failure. |
+| `run(*arguments, input, check, session)` | Run a system command with a fixed environment and no stdin; raise on failure. |
 | `nft_apply(text)` | `nft --check`, then apply. |
 | `docker_ready()` | Local rootful Linux Docker is running. |
 | `networks()` / `interface_exists(name)` / `table_names()` | Docker networks, links, nft tables. |
@@ -85,14 +86,15 @@ functions are added, removed or change their job. Architecture: [ARCHITECTURE.md
 | `hermes_profiles(user)` | Profiles of a user (incl. `default`). |
 | `hermes(*arguments)` | Run the Hermes CLI. |
 | `terminal_settings(profile)` | `hermes -p P config get terminal --json`. |
-| `container_label(profile, settings)` | The `hermes-profile` label Hermes gives the profile's containers. |
+| `container_label(profile, key)` | The `hermes-profile` label Hermes gives the profile's containers. |
 | `firewall_arg(argument)` | Is it an own `--network=`/`--net=`/`--dns=` entry? Refuses split `--network VALUE`. |
-| `hermes_info(profile)` | Checks (Docker backend, no shared sandbox), label and hints. |
+| `hermes_info(profile)` | Checks (Docker backend, no shared sandbox), shared key and hints (incl. sandbox escapes). |
 | `install_plugin(profile)` / `remove_plugin_files(target)` | Plugin into/out of a profile, own files only. |
 | `hermes_attach(profile, dns)` / `hermes_detach(profile)` | Connect the profile to its firewall / leave it without network. |
 | `user_command(words)` | Internal `_hermes info|attach|detach PROFILE`; refuses root. |
 | `hermes_user()` | The user behind sudo. |
-| `as_user(user, *arguments)` | Root runs `_hermes ...` as that user (`runuser -l`). |
+| `printable(text)` | Strip terminal control characters from untrusted output. |
+| `as_user(user, *arguments)` | Root runs `_hermes ...` as that user (`runuser -l`, new session, no stdin). |
 
 ## Sandboxes and sudoers
 

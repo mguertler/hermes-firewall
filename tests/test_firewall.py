@@ -158,8 +158,8 @@ class AddressTests(unittest.TestCase):
     def test_nat64_prefixes_from_dns64(self):
         with patch.object(fw, "resolve", return_value=["2001:db8:64::c000:aa", "2001:db8:64::c000:ab", "2001:db8::1"]):
             self.assertEqual(fw.nat64_prefixes(["9.9.9.9"]), [fw.NAT64_WKP, "2001:db8:64::/96"])
-        with patch.object(fw, "resolve", side_effect=OSError("timeout")):
-            self.assertEqual(fw.nat64_prefixes(["9.9.9.9"]), [fw.NAT64_WKP])
+        with patch.object(fw, "resolve", side_effect=OSError("timeout")), self.assertRaises(OSError):
+            fw.nat64_prefixes(["9.9.9.9"])
 
     def test_host_networks_ignore_virtual_and_public(self):
         links = [{"ifname": "lo", "addr_info": [{"family": "inet", "local": "127.0.0.1", "prefixlen": 8, "scope": "host"}]},
@@ -170,8 +170,16 @@ class AddressTests(unittest.TestCase):
                      {"family": "inet6", "local": "fe80::1", "prefixlen": 64, "scope": "link"}]},
                  {"ifname": "docker0", "addr_info": [{"family": "inet", "local": "172.17.0.1", "prefixlen": 16, "scope": "global"}]},
                  {"ifname": "hfw0123456789ab", "addr_info": [{"family": "inet", "local": "172.18.0.1", "prefixlen": 16, "scope": "global"}]}]
-        with patch.object(fw, "run", return_value=result(json.dumps(links))):
-            self.assertEqual(fw.host_networks(), ["192.168.0.0/24", "2a01:4f8:1:2::/64"])
+        routes4 = [{"dst": "default", "gateway": "192.168.0.1", "dev": "eth0"},
+                   {"dst": "192.168.0.0/24", "dev": "eth0"}, {"dst": "10.8.0.0/24", "dev": "wg0"},
+                   {"dst": "172.17.0.0/16", "dev": "docker0"}, {"dst": "10.9.0.0/16", "gateway": "10.8.0.1", "dev": "wg0"}]
+        # A DHCPv6 /128 address: the LAN /64 comes from the on-link route.
+        routes6 = [{"dst": "2a01:4f8:1:3::/64", "dev": "eth0"}, {"dst": "fe80::/64", "dev": "eth0"},
+                   {"dst": "default", "gateway": "fe80::1", "dev": "eth0"}]
+        outputs = {"addr": links, "-4": routes4, "-6": routes6}
+        with patch.object(fw, "run", side_effect=lambda *a, **k: result(json.dumps(outputs[a[2]]))):
+            self.assertEqual(fw.host_networks(), ["192.168.0.0/24", "2a01:4f8:1:2::/64", "10.8.0.0/24",
+                                                  "2a01:4f8:1:3::/64"])
 
     def test_proxy_ports_only_iron_proxy_of_a_user_on_the_docker_bridge(self):
         ss = ('LISTEN 0 4096 172.17.0.1:9090 0.0.0.0:* users:(("iron-proxy",pid=7,fd=3)) uid:1000 ino:1 sk:1\n'
@@ -183,6 +191,13 @@ class AddressTests(unittest.TestCase):
              patch.object(fw, "run", return_value=result(ss)):
             self.assertEqual(fw.proxy_ports(CONF), {1000: ["172.17.0.1 . tcp . 9090", "172.17.0.1 . tcp . 9091"]})
             self.assertEqual(fw.proxy_ports({**CONF, "egress_proxy": False}), {})
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for item in (patch.object(fw, "CACHE", Path(directory.name) / "resolved.json"), patch.object(fw, "trusted")):
+            item.start()
+            self.addCleanup(item.stop)
 
     def test_common_sets(self):
         conf = {**CONF, "lan_networks": ["auto", "fd00:1::/64"], "lan_hosts": ["nas.example"],
@@ -209,6 +224,28 @@ class AddressTests(unittest.TestCase):
             self.assertEqual(fw.common_sets(conf)["lan_v4"], ["192.168.0.0/24"])
             with self.assertRaisesRegex(fw.FirewallError, "unchanged"):
                 fw.common_sets(conf, strict=True)
+
+    def test_last_known_addresses_are_used_while_dns_is_down(self):
+        # Otherwise an Internet lease could reach the LAN host's public address at boot.
+        conf = {**CONF, "lan_hosts": ["nas.example"]}
+        with patch.object(fw, "resolve_host", return_value=["203.0.113.7"]), \
+             patch.object(fw, "nat64_prefixes", return_value=[fw.NAT64_WKP, "2001:db8:64::/96"]):
+            fw.common_sets(conf, strict=True)
+        with patch.object(fw, "resolve_host", side_effect=OSError("down")), \
+             patch.object(fw, "nat64_prefixes", side_effect=OSError("down")), patch("builtins.print"):
+            sets = fw.common_sets(conf)
+            with self.assertRaisesRegex(fw.FirewallError, "DNS64"):
+                fw.common_sets({**conf, "lan_hosts": []}, strict=True)
+        self.assertEqual(sets["lan_v4"], ["192.168.0.0/24", "203.0.113.7"])
+        self.assertIn("2001:db8:64::c0a8:0/120", sets["lan_v6"])
+
+    def test_overlapping_allow_networks_are_collapsed(self):
+        # nft refuses overlapping intervals in a concatenated set, which would break every table.
+        conf = {**CONF, "allow": [{"net": "10.0.0.0/8", "tcp": [443], "udp": []},
+                                  {"net": "10.1.0.0/16", "tcp": [443, 80], "udp": []}]}
+        with patch.object(fw, "nat64_prefixes", return_value=[fw.NAT64_WKP]):
+            sets = fw.common_sets(conf)
+        self.assertEqual(sets["allow_ports_v4"], ["10.1.0.0/16 . tcp . 80", "10.0.0.0/8 . tcp . 443"])
 
     def answer(self, query_id, rcode=0, records=(), qtype=1):
         question = b"\x06server\x07example\x00" + qtype.to_bytes(2, "big") + b"\x00\x01"
@@ -368,9 +405,9 @@ class ProfileTests(unittest.TestCase):
         calls = []
         def as_user(u, *arguments):
             calls.append(arguments)
-            return 'greeting from .profile\n{"label": "research", "hints": ["Hint: x"]}\n' if arguments[0] == "info" else ""
+            return 'greeting from .profile\n{"key": "", "hints": ["Hint: x"]}\n' if arguments[0] == "info" else ""
         with patch.object(fw, "load_config", return_value=CONF), patch.object(fw, "as_user", side_effect=as_user), \
-             patch.object(fw, "health"), patch.object(fw, "docker_ready"), \
+             patch.object(fw, "health"), patch.object(fw, "docker_ready"), patch.object(fw, "check_network"), \
              patch.object(fw, "networks", return_value={"hermes-fw-research"} if existing_network else set()), \
              patch.object(fw, "create_network") as network, patch.object(fw, "create_firewall") as create, \
              patch.object(fw, "ipv6_enabled", return_value=False), patch.object(fw, "save_registry"), \
@@ -426,9 +463,23 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(order[3], f"destroy table inet {fw.identity('research')['table']}\n")
         self.assertEqual(set(data["profiles"]), {"work"})
 
+    def test_add_refuses_answers_it_cannot_trust_and_label_clashes(self):
+        with hermes_home() as user:
+            for answer in ('{"label": "work"}', "no json", '{"key": 5, "hints": []}'):
+                with self.subTest(answer=answer), patch.object(fw, "load_config", return_value=CONF), \
+                     patch.object(fw, "as_user", return_value=answer), self.assertRaisesRegex(fw.FirewallError, "Unexpected"):
+                    fw.add_profile(registry(), "research", user)
+            data = registry("work")
+            data["profiles"]["work"]["label"] = "research"
+            with patch.object(fw, "load_config", return_value=CONF), \
+                 patch.object(fw, "as_user", return_value='{"key": "", "hints": []}'), \
+                 self.assertRaisesRegex(fw.FirewallError, "mixed up"):
+                fw.add_profile(data, "research", user)
+
     def test_status_wording(self):
         data = registry("research")
         with patch.object(fw, "hermes_profiles", return_value={"research", "work"}), patch.object(fw, "health"), \
+             patch.object(fw, "networks", return_value={"hermes-fw-research"}), patch.object(fw, "check_network"), \
              patch.object(fw, "load_config", return_value=CONF), patch.object(fw, "protect_sandboxes", return_value=[]), \
              patch.object(fw, "lease_remaining", side_effect=[2472, None]), patch("builtins.print") as output:
             fw.status(data, USER)
@@ -440,9 +491,15 @@ class ProfileTests(unittest.TestCase):
 
     def test_status_reports_broken_firewall(self):
         with patch.object(fw, "health", side_effect=fw.FirewallError("hook missing")), \
-             patch.object(fw, "load_config", return_value=CONF), patch("builtins.print"):
-            with self.assertRaisesRegex(fw.FirewallError, "restore"):
+             patch.object(fw, "load_config", return_value=CONF), patch("builtins.print") as output:
+            with self.assertRaisesRegex(fw.FirewallError, "problem for: research"):
                 fw.status(registry("research"), selected="research")
+        self.assertIn("Fix: sudo hermes-firewall restore", output.call_args.args[0])
+        with patch.object(fw, "health"), patch.object(fw, "networks", return_value=set()), \
+             patch.object(fw, "load_config", return_value=CONF), patch("builtins.print") as output:
+            with self.assertRaises(fw.FirewallError):
+                fw.status(registry("research"), selected="research")
+        self.assertIn("network is missing. Fix: sudo hermes-firewall add research", output.call_args.args[0])
 
     def test_left(self):
         self.assertEqual([fw.left(s) for s in (30, 59, 60, 2472, 3600, 7380)], ["30s", "59s", "1m", "41m", "1h", "2h 03m"])
@@ -476,9 +533,18 @@ class HermesSideTests(unittest.TestCase):
             with self.assertRaisesRegex(fw.FirewallError, "share one sandbox"):
                 fw.hermes_info("research")
             settings["work"] = self.settings()
-            label = fw.hermes_info("research")["label"]
+            key = fw.hermes_info("research")["key"]
+        self.assertEqual(key, "team")
+        label = fw.container_label("research", key)
         self.assertTrue(label.startswith("team-") and len(label) == 17)
-        self.assertEqual(fw.container_label("research", self.settings()), "research")
+        self.assertEqual(fw.container_label("research"), "research")
+
+    def test_info_warns_about_sandbox_escapes(self):
+        settings = self.settings(docker_extra_args=["--privileged"], docker_volumes=["/var/run/docker.sock:/s"])
+        with patch.object(fw, "terminal_settings", return_value=settings):
+            hint = fw.hermes_info("research")["hints"][0]
+        self.assertIn("--privileged", hint)
+        self.assertIn("docker.sock", hint)
 
     def test_info_hints(self):
         with patch.object(fw, "terminal_settings", return_value=self.settings(docker_mount_cwd_to_workspace=True)):

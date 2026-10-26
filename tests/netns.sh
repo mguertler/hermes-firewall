@@ -21,13 +21,14 @@ trap cleanup EXIT
 # resolving to its external address 93.184.1.7, DNS 192.168.0.5 and
 # 2606:4700:4700::1111, allow 192.168.0.2 tcp 8088 and 203.0.113.0/24 (all
 # ports), Hermes egress proxy 172.17.0.1:9090 (docker0 of the host).
-read -r bridge subnet6 < <(python3 -I - "$here/../hermes_firewall.py" "$work" <<'PY'
+read -r bridge subnet6 < <(python3 -I -B - "$here/../hermes_firewall.py" "$work" <<'PY'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("fw", sys.argv[1])
 fw = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fw)
 out = Path(sys.argv[2])
+fw.CACHE, fw.trusted = out / "resolved.json", lambda path: None
 fw.resolve_host = lambda host, servers: ["93.184.1.7"]
 fw.nat64_prefixes = lambda servers: [fw.NAT64_WKP]
 conf = {"lan_networks": ["192.168.0.0/24", "fd00:1::/64", "2a01:db8:1:2::/64"], "lan_hosts": ["lanhost.test"],

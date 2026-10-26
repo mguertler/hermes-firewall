@@ -124,7 +124,18 @@ tcp = [8088]
   (`docker_shared_container_key`) cannot be protected.
 - With `docker_requires_firewall = true` (default) Docker does not start at all if the
   firewall cannot be loaded at boot. If `nftables.service` uses `flush ruleset` and is
-  restarted later, the firewall is restored (closed) within 5 minutes.
+  restarted later, the firewall is restored (closed) within 5 minutes; until then the
+  sandboxes are not filtered.
+- Settings like `--privileged` or a mounted `docker.sock` let code escape the sandbox;
+  `add` warns about them, but no firewall can contain an escaped process.
+- LAN detection (`"auto"`) sees the networks the host is directly connected to. Add
+  other parts of your LAN yourself, e.g. the rest of a delegated IPv6 prefix. If your
+  router forwards ports from its public address into the LAN (hairpin NAT), add the
+  router's public name to `lan.hosts`. NAT64 is handled for `64:ff9b::/96` and for /96
+  prefixes announced by your DNS64 server.
+- Profile names are unique per host: if several users run Hermes on one host, give
+  their profiles different names.
+- Lease times do not run while the host is suspended.
 - IP based, not a domain allow list.
 
 ## Uninstall

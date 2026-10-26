@@ -9,8 +9,10 @@ These must stay true. Change them only deliberately, together with tests and doc
 - An Internet lease never opens the LAN (`lan_v4/v6`, including public addresses of
   LAN hosts and NAT64-embedded LAN addresses). A LAN lease opens only the LAN.
 - In every state only the configured DNS servers (port 53) and the `[[allow]]` entries
-  are reachable. LAN networks in the configuration must be private (IPv4) or ULA /
-  prefixes of /48 or longer (IPv6), so a typo cannot turn "lan" into Internet.
+  are reachable. A name that does not resolve never widens what a lease opens: strict
+  resolution, or the last known addresses at boot. LAN networks in the configuration
+  must be private (IPv4) or ULA / prefixes of /48 or longer (IPv6), so a typo cannot
+  turn "lan" into Internet.
 - The host itself is never reachable from a sandbox, except IPv6 neighbour discovery and
   the egress-proxy ports of the profile's own user.
 - IPv4 and IPv6 are filtered the same way. Addresses that embed IPv4 (NAT64, 6to4,
@@ -27,7 +29,11 @@ These must stay true. Change them only deliberately, together with tests and doc
   stop/restart Docker. Only this package's tables, networks, files and units.
 - Profiles are independent: adding or removing one never changes another's leases.
 - Root never edits Hermes files. Only `_hermes info|attach|detach`, run as the Hermes
-  user, changes a profile, and only through the Hermes CLI.
+  user, changes a profile, and only through the Hermes CLI. Root never trusts what that
+  process prints: it validates the answer, computes container labels itself, strips
+  control characters and gives the process no terminal (no stdin, new session).
+- Sandboxes of one protected profile are never moved into another's network; two
+  protected profiles never share a container label.
 - In a Hermes profile only `terminal.docker_network` and the own `--network=` / `--dns=`
   entries of `terminal.docker_extra_args` are set, plus the plugin directory. Never
   `container_persistent`, `docker_shared_container_key`, `cwd`, `backend` or other

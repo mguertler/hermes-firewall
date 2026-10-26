@@ -25,6 +25,8 @@ VERSION = "2.0.0"
 CONF = Path("/etc/hermes-firewall")
 REGISTRY = CONF / "profiles.json"
 CONFIG = CONF / "config.toml"
+# Last addresses of lan.hosts and DNS64 prefixes that resolved: used at boot when DNS is not up yet.
+CACHE = CONF / "resolved.json"
 EXE = Path("/usr/local/bin/hermes-firewall")
 # Plugin source that `add` copies into a Hermes profile (as the Hermes user).
 SHARE = Path("/usr/local/share/hermes-firewall")
@@ -73,7 +75,6 @@ WantedBy=multi-user.target
 REFRESH_TEXT = f"""[Unit]
 Description=Hermes Agent sandbox firewall: refresh addresses and protect sandboxes
 After=hermes-firewall.service network-online.target
-Requisite=hermes-firewall.service
 
 [Service]
 Type=oneshot
@@ -319,6 +320,7 @@ def dns_answer(query_id, data, qtype=1):
         offset = skip_name(data, offset)
         kind, length = int.from_bytes(data[offset:offset + 2], "big"), int.from_bytes(data[offset + 8:offset + 10], "big")
         offset += 10
+        require(offset + length <= len(data), "Truncated DNS record.")
         if kind == qtype and length == size:
             found.append(socket.inet_ntop(af, data[offset:offset + size]))
         offset += length
@@ -336,7 +338,7 @@ def resolve(host, servers, qtype=1):
                 sock.connect((server, 53))
                 sock.send(packet)
                 return dns_answer(query_id, sock.recv(4096), qtype)
-            except (OSError, FirewallError, IndexError) as error:
+            except (OSError, FirewallError, IndexError, ValueError) as error:
                 errors.append(f"{server}: {error}")
     raise OSError("; ".join(errors))
 
@@ -354,13 +356,11 @@ def resolve_host(host, servers):
 
 
 def nat64_prefixes(servers):
-    """The well-known NAT64 prefix plus prefixes announced by DNS64 (ipv4only.arpa, RFC 7050)."""
+    """The well-known NAT64 prefix plus /96 prefixes announced by DNS64 (ipv4only.arpa, RFC 7050).
+
+    Raises OSError if the DNS servers do not answer."""
     prefixes = [NAT64_WKP]
-    try:
-        answers = resolve("ipv4only.arpa", servers, 28)
-    except OSError:
-        answers = []
-    for answer in answers:
+    for answer in resolve("ipv4only.arpa", servers, 28):
         value = int(ipaddress.IPv6Address(answer))
         if value & 0xFFFFFFFF in (0xC00000AA, 0xC00000AB):  # 192.0.0.170 / .171
             prefixes.append(f"{ipaddress.IPv6Address(value & ~0xFFFFFFFF)}/96")
@@ -376,12 +376,21 @@ def host_networks():
         for item in link.get("addr_info", []):
             if item.get("family") not in ("inet", "inet6") or item.get("scope") != "global":
                 continue
-            network = str(ipaddress.ip_interface(f"{item['local']}/{item['prefixlen']}").network)
-            try:
-                found.append(lan_network(network))
-            except FirewallError:
-                continue  # e.g. a public IPv4 address of the host: never LAN
-    return found
+            found.append(f"{item['local']}/{item['prefixlen']}")
+    # On-link routes cover e.g. the /64 behind a DHCPv6 /128 address.
+    for version in ("-4", "-6"):
+        for route in json.loads(run("ip", "-j", version, "route", "show", "table", "main").stdout or "[]"):
+            if not route.get("gateway") and route.get("dst", "default") != "default" \
+                    and route.get("type", "unicast") == "unicast" \
+                    and not route.get("dev", "").startswith(VIRTUAL_INTERFACES):
+                found.append(route["dst"])
+    networks = []
+    for item in found:
+        try:
+            networks.append(lan_network(str(ipaddress.ip_network(item, strict=False))))
+        except (FirewallError, ValueError):
+            continue  # e.g. a public IPv4 address of the host: never LAN
+    return unique(networks)
 
 
 def docker_gateway():
@@ -408,23 +417,52 @@ def proxy_ports(conf):
     return result
 
 
+def load_cache():
+    if not CACHE.exists():
+        return {"hosts": {}, "nat64": []}
+    trusted(CACHE)
+    data = json.loads(CACHE.read_text(encoding="utf-8"))
+    require(type(data) is dict and type(data.get("hosts")) is dict and type(data.get("nat64")) is list,
+            f"Invalid {CACHE}; delete it.")
+    return data
+
+
 def common_sets(conf, strict=False):
-    """Set elements shared by all profiles (everything except the per-user host ports)."""
+    """Set elements shared by all profiles (everything except the per-user host ports).
+
+    strict: fail if a name does not resolve (refresh keeps the current sets). Otherwise
+    (boot, before DNS works) use the last addresses that resolved."""
+    cache = load_cache()
+    old = json.dumps(cache, sort_keys=True)
     lan = []
     for network in conf["lan_networks"]:
         lan += host_networks() if network == "auto" else [network]
     for host in conf["lan_hosts"]:
         try:
-            lan += resolve_host(host, conf["dns"])
+            cache["hosts"][host] = resolve_host(host, conf["dns"])
         except OSError as error:
             require(not strict, f"Cannot resolve LAN host {host}: {error}; addresses left unchanged.")
-            print(f"WARNING: cannot resolve LAN host {host} ({error}); it stays blocked until refresh.",
-                  file=sys.stderr)
+            print(f"WARNING: cannot resolve LAN host {host} ({error}); using its last known addresses "
+                  f"{cache['hosts'].get(host) or '(none)'}.", file=sys.stderr)
+        lan += cache["hosts"].get(host, [])
+    try:
+        cache["nat64"] = nat64_prefixes(conf["dns"])
+    except OSError as error:
+        require(not strict, f"DNS64 lookup failed: {error}; addresses left unchanged.")
+    prefixes = unique([NAT64_WKP, *cache["nat64"]])
+    if json.dumps(cache, sort_keys=True) != old:
+        atomic_write(CACHE, json.dumps(cache, indent=2, sort_keys=True) + "\n")
     lan4 = [a for a in lan if family(a) == 4]
-    prefixes = nat64_prefixes(conf["dns"])
     whole = [e["net"] for e in conf["allow"] if not e["tcp"] and not e["udp"]]
-    services = [f"{e['net']} . {proto} . {port}" for e in conf["allow"] for proto in ("tcp", "udp")
-                for port in e[proto]]
+    # Overlapping networks for the same port would make nft refuse the whole table: collapse them.
+    groups = {}
+    for entry in conf["allow"]:
+        for proto in ("tcp", "udp"):
+            for port in entry[proto]:
+                network = ipaddress.ip_network(entry["net"])
+                groups.setdefault((network.version, proto, port), []).append(network)
+    services = [f"{network} . {proto} . {port}" for (_, proto, port), items in sorted(groups.items())
+                for network in ipaddress.collapse_addresses(items)]
     return {"lan_v4": unique(lan4), "lan_v6": unique([a for a in lan if family(a) == 6] + nat64(prefixes, lan4)),
             "dns_v4": [d for d in conf["dns"] if family(d) == 4], "dns_v6": [d for d in conf["dns"] if family(d) == 6],
             "allow_v4": [n for n in whole if family(n) == 4], "allow_v6": [n for n in whole if family(n) == 6],
@@ -616,11 +654,13 @@ def save_registry(data):
     atomic_write(REGISTRY, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
-def run(*arguments, input=None, check=True):
+def run(*arguments, input=None, check=True, session=False):
     executable = shutil.which(arguments[0], path=ENV["PATH"])
     require(executable, f"Missing command: {arguments[0]}")
-    result = subprocess.run([executable, *arguments[1:]], input=input, text=True,
-                            capture_output=True, env=ENV, timeout=90)
+    # Children never get the admin's terminal: no stdin, and a new session on request.
+    stdin = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
+    result = subprocess.run([executable, *arguments[1:]], **stdin, text=True, capture_output=True,
+                            env=ENV, timeout=90, start_new_session=session)
     if check and result.returncode:
         raise FirewallError(f"{' '.join(arguments)} failed ({result.returncode}):\n"
                             f"{result.stderr.strip() or result.stdout.strip()}")
@@ -777,9 +817,8 @@ def terminal_settings(profile):
     return settings
 
 
-def container_label(profile, settings):
+def container_label(profile, key=""):
     """The hermes-profile label Hermes puts on this profile's sandboxes."""
-    key = settings.get("docker_shared_container_key") or ""
     if not key:
         return re.sub(r"[^A-Za-z0-9_.-]", "_", profile)[:63]
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
@@ -813,9 +852,14 @@ def hermes_info(profile):
     if settings.get("docker_mount_cwd_to_workspace"):
         hints.append("Hint: this profile shows your host working directory in the sandbox "
                      "(docker_mount_cwd_to_workspace); with an open lease the agent could send those files out.")
-    for argument in settings.get("docker_extra_args") or []:
-        firewall_arg(str(argument))
-    return {"label": container_label(profile, settings), "hints": hints}
+    arguments = [str(a) for a in settings.get("docker_extra_args") or []]
+    for argument in arguments:
+        firewall_arg(argument)
+    escapes = re.findall(r"--privileged\S*|\S*docker\.sock\S*|--pid[= ]host|--userns[= ]host|--cap-add[= ](?:ALL|SYS_ADMIN)",
+                         " ".join(arguments + [str(v) for v in settings.get("docker_volumes") or []]))
+    if escapes:
+        hints.append(f"Warning: {', '.join(escapes)} lets code escape the sandbox; no firewall can contain it then.")
+    return {"key": key, "hints": hints}
 
 
 def install_plugin(profile):
@@ -892,13 +936,20 @@ def hermes_user():
     return pwd.getpwnam(name)
 
 
+def printable(text):
+    """Output of user-controlled processes without terminal control sequences."""
+    return re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", text)
+
+
 def as_user(user, *arguments):
-    """Hermes files are changed by the user's own process, never by root."""
+    """Hermes files are changed by the user's own process, never by root.
+
+    Its output is not trusted: login shells may print anything."""
     command = shlex.join([str(EXE), "_hermes", *arguments])
-    result = run("runuser", "-l", user.pw_name, "-c", command, check=False)
-    message = result.stderr.strip().removeprefix("ERROR: ")
+    result = run("runuser", "-l", user.pw_name, "-c", command, check=False, session=True)
+    message = printable(result.stderr.strip()).removeprefix("ERROR: ")
     require(result.returncode == 0, message or f"{command} failed as {user.pw_name}.")
-    return result.stdout
+    return printable(result.stdout)
 
 
 # --- sandboxes -----------------------------------------------------------------------------
@@ -926,6 +977,8 @@ def protect_sandboxes(profile, record, conf, interactive=False, yes=False):
     for container in sandboxes(record["label"]):
         mode = (container.get("HostConfig") or {}).get("NetworkMode") or ""
         attached = set((container.get("NetworkSettings") or {}).get("Networks") or {})
+        if any(name.startswith("hermes-fw-") and name != network for name in attached):
+            continue  # protected by another profile's firewall: not ours to move
         reason = None
         if mode == "host" or mode == "none" or mode.startswith("container:"):
             reason = "it has no network at all" if mode == "none" else "it uses the host's network"
@@ -1007,7 +1060,7 @@ def create_firewall(data, profile, record, conf):
     require(item["network"] not in networks(), f"Network already exists: {item['network']}")
     require(item["table"] not in table_names(), f"Firewall table already exists: {item['table']}")
     require(not interface_exists(item["bridge"]), f"Interface already exists: {item['bridge']}")
-    text = rules(profile, profile_sets(record, common_sets(conf), proxy_ports(conf)))
+    text = rules(profile, profile_sets(record, common_sets(conf, strict=True), proxy_ports(conf)))
     run("nft", "--check", "--file", "-", input=text)
     data["profiles"][profile] = record
     # Persist protection BEFORE making a network available; partial failure stays closed.
@@ -1034,15 +1087,26 @@ def add_profile(data, profile, user, yes=False):
             f"{profile} is protected for user {existing and existing['user']}; run add as that user.")
     conf = load_config()
     # The last line: login shells may print their own greetings first.
-    info = json.loads((as_user(user, "info", profile).strip().splitlines() or ["{}"])[-1])
+    try:
+        info = json.loads((as_user(user, "info", profile).strip().splitlines() or [""])[-1])
+        require(type(info) is dict and type(info.get("key")) is str and len(info["key"]) <= 256
+                and type(info.get("hints")) is list and all(type(h) is str for h in info["hints"]), "")
+    except (ValueError, FirewallError):
+        raise FirewallError(f"Unexpected answer when checking Hermes profile {profile}.") from None
+    label = container_label(profile, info["key"])
+    clash = [p for p, r in data["profiles"].items() if p != profile and r["label"] == label]
+    if clash:
+        raise FirewallError(f"The sandboxes of {profile} would be mixed up with those of {clash[0]}; "
+                            "check terminal.docker_shared_container_key.")
     if existing:
         health(profile)  # Re-running add repairs the network, the Hermes side and the sandboxes.
-        existing["label"] = info["label"]
+        existing["label"] = label
         docker_ready()
         if identity(profile)["network"] not in networks():
             create_network(profile, existing)
+        check_network(profile, existing)
     else:
-        record = {"user": user.pw_name, "ipv6": ipv6_enabled(conf), "label": info["label"], "dns": []}
+        record = {"user": user.pw_name, "ipv6": ipv6_enabled(conf), "label": label, "dns": []}
         create_firewall(data, profile, record, conf)
     as_user(user, "attach", profile)
     data["profiles"][profile]["dns"] = conf["dns"]
@@ -1113,14 +1177,22 @@ def status(data, user=None, selected=None, verbose=False):
             continue
         try:
             health(profile)
-            messages = protect_sandboxes(profile, data["profiles"][profile], conf)
-            print(profile_line(profile))
-            for message in messages:
-                print(message)
         except FirewallError as error:
             problems.append(profile)
-            print(f"{profile}: ERROR - the firewall is not working: {error}")
+            print(f"{profile}: ERROR - the firewall is not working ({error}). "
+                  "Fix: sudo hermes-firewall restore (closes all leases)")
             continue
+        try:
+            require(identity(profile)["network"] in networks(), "its Docker network is missing")
+            check_network(profile, data["profiles"][profile])
+            messages = protect_sandboxes(profile, data["profiles"][profile], conf)
+        except FirewallError as error:
+            problems.append(profile)
+            print(f"{profile}: ERROR - {error}. Fix: sudo hermes-firewall add {profile}")
+            continue
+        print(profile_line(profile))
+        for message in messages:
+            print(message)
         if verbose:
             item = identity(profile)
             print(f"  network {item['network']}, bridge {item['bridge']}, table inet {item['table']}, "
@@ -1131,27 +1203,38 @@ def status(data, user=None, selected=None, verbose=False):
                       f"{', '.join((container.get('NetworkSettings') or {}).get('Networks') or {}) or 'none'}")
     if conf and not selected:
         print(f"Always reachable from protected sandboxes: {always_text(conf)}")
-    require(not problems, f"Firewall problem for: {', '.join(problems)}. "
-                          "Fix: sudo hermes-firewall restore (closes all leases)")
+    require(not problems, f"Firewall problem for: {', '.join(problems)}.")
 
 
 def refresh(data):
-    """Timer job: heal missing tables (closed), refresh addresses, follow DNS changes, protect sandboxes."""
-    missing = [p for p in sorted(data["profiles"]) if identity(p)["table"] not in table_names()]
-    if missing:
-        sets = all_sets(data)
-        nft_apply("".join(rules(p, sets[p]) for p in missing))
-        print(f"Firewall restored (closed) for: {', '.join(missing)}", file=sys.stderr)
+    """Timer job: heal missing tables (closed), refresh addresses, follow DNS changes, protect sandboxes.
+
+    Every step runs even if an earlier one failed; the failures are reported at the end."""
+    problems = []
+    def attempt(what, step):
+        try:
+            step()
+        except (FirewallError, OSError, KeyError, ValueError, subprocess.SubprocessError) as error:
+            problems.append(f"{what}: {error}")
+    def heal():
+        missing = [p for p in sorted(data["profiles"]) if identity(p)["table"] not in table_names()]
+        if missing:
+            sets = all_sets(data)
+            nft_apply("".join(rules(p, sets[p]) for p in missing))
+            print(f"Firewall restored (closed) for: {', '.join(missing)}", file=sys.stderr)
+    attempt("restore", heal)
     # Strict: on a resolution failure the current addresses stay in place.
-    nft_apply(refresh_transaction(data, all_sets(data, strict=True)))
+    attempt("addresses", lambda: nft_apply(refresh_transaction(data, all_sets(data, strict=True))))
     conf = load_config()
     for profile, record in sorted(data["profiles"].items()):
-        if record["dns"] != conf["dns"]:
-            as_user(pwd.getpwnam(record["user"]), "attach", profile)
-            record["dns"] = conf["dns"]
-            save_registry(data)
-        for message in protect_sandboxes(profile, record, conf):
-            print(message)
+        def follow_dns():
+            if record["dns"] != conf["dns"]:
+                as_user(pwd.getpwnam(record["user"]), "attach", profile)
+                record["dns"] = conf["dns"]
+                save_registry(data)
+        attempt(profile, follow_dns)
+        attempt(profile, lambda: [print(m) for m in protect_sandboxes(profile, record, conf)])
+    require(not problems, "; ".join(problems))
 
 
 # --- installation --------------------------------------------------------------------------
@@ -1204,7 +1287,7 @@ def install(bundle):
                if p.exists() or p.is_symlink()]
     require(not present, f"hermes-firewall is already/partially installed: {', '.join(present)}. "
                          "Run install.sh to upgrade.")
-    require(not CONF.exists() or {p.name for p in CONF.iterdir()} <= {"config.toml"},
+    require(not CONF.exists() or {p.name for p in CONF.iterdir()} <= {"config.toml", "resolved.json"},
             f"{CONF} contains unknown files; refusing installation.")
     for command in ("nft", "docker", "systemctl", "ip", "ss", "runuser", "visudo"):
         require(shutil.which(command, path=ENV["PATH"]), f"Missing program: {command}")
@@ -1279,7 +1362,7 @@ def uninstall(data, purge=False):
     require(not any(name.startswith("hermes_fw_") for name in table_names()),
             "Firewall tables of hermes-firewall remain; refusing uninstall.")
     names = {p.name for p in CONF.iterdir()}
-    require(names <= {"profiles.json", "config.toml"}, f"{CONF} contains unknown files; refusing uninstall.")
+    require(names <= {"profiles.json", "config.toml", "resolved.json"}, f"{CONF} contains unknown files; refusing uninstall.")
     # Detach the dependency BEFORE disabling the guard; never restart/stop Docker.
     if DROPIN.exists():
         DROPIN.unlink()
@@ -1289,7 +1372,7 @@ def uninstall(data, purge=False):
     run("systemctl", "disable", "--now", REFRESH_TIMER.name, check=False)
     run("systemctl", "stop", SERVICE)
     run("systemctl", "disable", SERVICE)
-    for path in (UNIT, REFRESH_UNIT, REFRESH_TIMER, SUDOERS, REGISTRY, EXE,
+    for path in (UNIT, REFRESH_UNIT, REFRESH_TIMER, SUDOERS, REGISTRY, CACHE, EXE,
                  *(SHARE / "plugin" / name for name in PLUGIN_FILES)):
         path.unlink(missing_ok=True)
     for folder in (SHARE / "plugin", SHARE):
@@ -1359,7 +1442,15 @@ def main(argv=None):
         info = os.fstat(lock.fileno())
         require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1
                 and not info.st_mode & 0o022, "Unsafe lock file; refusing concurrent state changes.")
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        deadline = time.monotonic() + 120
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                require(time.monotonic() < deadline, "Another hermes-firewall command has been running for "
+                                                     "2 minutes; nothing was changed. Try again later.")
+                time.sleep(0.2)
         verb, rest = words[0], words[1:]
         if verb in ("install", "upgrade"):
             require(not rest and type(options.get("--bundle")) is str, "Use install.sh.")

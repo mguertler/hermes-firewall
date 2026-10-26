@@ -13,6 +13,7 @@ stay true: [INVARIANTS.md](INVARIANTS.md); tests: [TESTING.md](TESTING.md).
 /usr/local/share/hermes-firewall/plugin/  plugin source that `add` copies into profiles
 /etc/hermes-firewall/config.toml          settings (admin-owned, never overwritten)
 /etc/hermes-firewall/profiles.json        registry of protected profiles
+/etc/hermes-firewall/resolved.json        last addresses of lan.hosts and DNS64 prefixes that resolved
 /etc/sudoers.d/hermes-firewall            NOPASSWD open/close/status per protected profile
 /etc/systemd/system/hermes-firewall.service           restore at boot (all closed)
 /etc/systemd/system/hermes-firewall-refresh.{service,timer}   every 5 minutes
@@ -72,8 +73,15 @@ bridge with `timeout Ns` in one nft transaction.
 `common_sets(conf)` builds the elements shared by all profiles:
 
 - LAN: configured networks, or with `"auto"` the networks the host is directly connected
-  to (`host_networks`, without Docker and other virtual bridges), plus the addresses of
-  `lan.hosts`, plus all IPv4 LAN entries embedded in every NAT64 prefix.
+  to (`host_networks`: interface addresses and on-link routes, without Docker and other
+  virtual bridges), plus the addresses of `lan.hosts`, plus all IPv4 LAN entries embedded
+  in every NAT64 prefix.
+- Resolution of `lan.hosts` and DNS64 is strict for `add`, `refresh` and `upgrade` (on a
+  failure nothing changes). At boot (`restore`) DNS may not work yet: then the last
+  results from `resolved.json` are used, so an Internet lease never reaches a LAN host
+  just because its name did not resolve.
+- `[[allow]]` entries with ports are collapsed per protocol and port
+  (`ipaddress.collapse_addresses`): nft refuses overlapping intervals in a concatenated set.
 - NAT64 prefixes: `64:ff9b::/96` plus prefixes announced by DNS64 (`ipv4only.arpa`,
   RFC 7050), detected on every refresh.
 - Host names are resolved by a small DNS client (`dns_query`, `dns_answer`, `resolve`,
@@ -96,13 +104,16 @@ behind systemd-resolved).
 ## Hermes coupling
 
 Hermes files are changed only by the Hermes user's own process: root runs
-`runuser -l USER -c 'hermes-firewall _hermes info|attach|detach PROFILE'`, which uses the
+`runuser -l USER -c 'hermes-firewall _hermes info|attach|detach PROFILE'` (no stdin, own
+session, output stripped of control characters and not trusted), which uses the
 Hermes CLI (`hermes -p P config get terminal --json`, `config set ...`,
 `plugins enable|disable`). Hermes' `config set` keeps comments in `config.yaml`.
 
 - `info`: refuses profiles without `terminal.backend: docker` and profiles that share one
   sandbox (`docker_shared_container_key` used by another profile of the user); returns
-  the container label and hints (e.g. `docker_mount_cwd_to_workspace`).
+  the shared key and hints (e.g. `docker_mount_cwd_to_workspace`, `--privileged`,
+  `docker.sock`). Root computes the container label from the key itself
+  (`container_label`) and refuses a label another protected profile already uses.
 - `attach`: `docker_network: true`, own `--network=hermes-fw-P` and `--dns=` entries in
   `docker_extra_args` (other entries stay), installs and enables the plugin.
 - `detach`: `docker_network: false` (Hermes then runs the sandbox with `--network=none`),
@@ -116,7 +127,7 @@ Nothing else is set; `container_persistent`, `docker_shared_container_key`, `cwd
 Hermes reuses long-lived containers (`container_persistent: true`); its reuse check does
 not include the network. `protect_sandboxes()` therefore looks up the profile's
 containers (`hermes-agent=1`, `hermes-profile=LABEL`) and moves those outside the
-profile network into it (`docker network disconnect`, then `connect`). That only ever
+profile network into it (never containers in another profile's `hermes-fw-*` network) (`docker network disconnect`, then `connect`). That only ever
 restricts access, so `add`, `status` and `refresh` do it without asking. Containers that
 cannot be moved (host, none or container network mode) or still have other DNS servers
 (the DNS servers of a container cannot be changed) need a reset: `add` asks on a
@@ -134,7 +145,10 @@ to run `sudo hermes-firewall add PROFILE`.
 - `restore` (boot): all tables in one transaction, all closed.
 - `refresh` (timer): restores missing tables (closed), replaces all address sets in one
   transaction (strict: on a resolution failure nothing changes), re-attaches profiles
-  whose DNS servers changed, protects sandboxes.
+  whose DNS servers changed, protects sandboxes. Every step runs even if another failed;
+  failures are reported at the end (exit code 1, journal).
+
+All root commands take the global lock; a command waits at most 2 minutes for it.
 
 ## Plugin and sudoers
 
@@ -150,7 +164,8 @@ wildcards, `open` and `close` accept no options at all (`parse`).
 
 - `hermes-firewall.service` (oneshot, `RemainAfterExit`, no `ExecStop`) runs `restore`;
   ordered after nftables/firewalld/ufw and before Docker. The Docker drop-in
-  (`docker_requires_firewall = true`) makes Docker fail closed if it fails.
+  (`docker_requires_firewall = true`) makes Docker fail closed if it fails. The refresh
+  timer does not depend on the service, so it also repairs a failed boot restore.
 - `install.sh` copies the files to a private temporary directory and runs
   `hermes_firewall.py --bundle=DIR install` (or `upgrade` if `profiles.json` exists).
   `install` must not start the service itself (its ExecStart would wait for the lock);
@@ -160,3 +175,12 @@ wildcards, `open` and `close` accept no options at all (`parse`).
   re-attaches every profile (new plugin, DNS).
 - `uninstall` refuses while profiles, package networks or tables exist; keeps
   `config.toml` unless `--purge`.
+
+## Known limits
+
+Lease timeouts do not run while the host is suspended (kernel timers). NAT64 prefixes
+other than /96 and prefixes announced only by the router (PREF64) are not detected.
+LAN parts that are not directly connected (e.g. other /64s of a delegated prefix) and
+router hairpin NAT must be configured. After `flush ruleset` by another tool, sandboxes
+are unfiltered until the next refresh (at most 5 minutes). Profile names are global per
+host (one registry), even with several Hermes users.
