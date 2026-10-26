@@ -1115,6 +1115,12 @@ def create_network(profile, record):
         "--label", f"{LABEL}={profile}", item["network"])
 
 
+def restart_hint(profile):
+    """Running Hermes processes load plugins and settings only when they start."""
+    return (f"Restart what runs Hermes for {profile}: the gateway (hermes -p {profile} gateway restart) and the\n"
+            f"backend of the desktop app (hermes -p {profile} dashboard --stop, then start it again); then start a new chat.")
+
+
 def add_profile(data, profile, user, yes=False):
     identity(profile)
     require(hermes_home(user.pw_dir, profile).is_dir(),
@@ -1153,7 +1159,7 @@ def add_profile(data, profile, user, yes=False):
     for message in [*info["hints"], *protect_sandboxes(profile, data["profiles"][profile], conf, True, yes)]:
         print(message)
     print(profile_line(profile))
-    print(f"Restart the Hermes gateway (if used: hermes -p {profile} gateway restart) and start a new session.\n"
+    print(restart_hint(profile) + "\n"
           "In the chat: /firewall open, /firewall open lan 30m, /firewall close, /firewall status")
 
 
@@ -1178,7 +1184,7 @@ def remove_profile(data, profile):
     save_registry(data)
     write_sudoers(data)
     print(f"{profile}: firewall removed. Its sandbox now has no network at all.")
-    print(f"Restart the Hermes gateway (if used: hermes -p {profile} gateway restart) and start a new session.")
+    print(restart_hint(profile))
 
 
 def open_lease(data, profile, words):

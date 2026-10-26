@@ -53,8 +53,10 @@ sudo hermes-firewall add default
 
 `add` connects the profile's sandbox to its firewall network, installs the `/firewall`
 command into that profile and allows it to open and close exactly this profile's
-firewall (`/etc/sudoers.d/hermes-firewall`). Restart the Hermes gateway if you use one
-(`hermes -p default gateway restart`) and start a new session.
+firewall (`/etc/sudoers.d/hermes-firewall`). Running Hermes processes load plugins only
+when they start: restart the gateway (`hermes -p default gateway restart`, for Telegram,
+Discord, ...) and the backend of the desktop app (`hermes -p default dashboard --stop`,
+then start it again), then start a new chat.
 
 ## Usage
 
@@ -73,6 +75,10 @@ is 24 hours (or less, see `lease.max` below). Opening again restarts the time.
 
 In a chat of a protected profile, `/firewall` does the same for that profile:
 `/firewall open`, `/firewall open lan 30m`, `/firewall close`, `/firewall status`.
+It works when typed on every platform. Telegram's `/` menu holds only 60 commands and
+Hermes' own fill it; to list `/firewall` there too:
+`hermes -p PROFILE config set platforms.telegram.extra.command_menu.priority '["firewall"]'`
+and restart the gateway.
 
 ### What a sandbox can reach
 
