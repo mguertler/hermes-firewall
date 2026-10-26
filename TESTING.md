@@ -73,8 +73,8 @@ Not covered automatically; record the result (distribution, versions, date) belo
    `--network=host` asks for a reset.
 4. `remove`: new sessions have no network; `add` again works.
 5. IPv6 (host with IPv6): `open` reaches IPv6 sites, closed does not.
-6. Hermes egress proxy (`hermes egress setup/start`): reachable from the sandbox in every
-   state, other host ports not.
+6. Hermes egress proxy (`hermes egress setup/start`, `proxy.enforce_on_docker false`):
+   reachable from the sandbox in every state, other host ports and its management port not.
 7. `sudo ./install.sh` again (upgrade) keeps leases open; `uninstall.sh` and `--purge`.
 8. Distributions: Debian 13, Ubuntu 24.04, Fedora, Arch, openSUSE (install, add, open, close).
 
@@ -90,4 +90,8 @@ Not covered automatically; record the result (distribution, versions, date) belo
 | 2026-10-26 | manual 2 (Hermes creates the sandbox in hermes-fw-default with our DNS; /firewall status/open/close in Hermes; curl closed/open/closed) | test VM, Ollama ministral-3:8b | pass |
 | 2026-10-26 | manual 3 (old sandbox on bridge moved, host-network sandbox reported, add --yes resets) | test VM | pass |
 | 2026-10-26 | manual 7 (upgrade keeps an open lease), sudoers with a restricted user (only open/close/status; options refused) | test VM | pass |
-| | manual 4 (remove + new session), 5 (IPv6: needs Docker 27+), 6 (egress proxy), 7 (uninstall), 8 (live on other distributions) | | **not done yet** |
+| 2026-10-27 | manual 4 (remove: Hermes recreates the sandbox with NetworkMode=none, no network; add again resets it) | test VM | pass |
+| 2026-10-27 | manual 5 (IPv6 with Docker CE 29.9.2: LAN global + ULA and Internet per lease, host blocked; integration.sh with IPv6) | test VM | pass |
+| 2026-10-27 | manual 6 (iron-proxy 0.39.0: add explains enforce_on_docker; tunnel and HTTP port reachable while closed, management port and other host ports blocked; same proxy answers with and without firewall) | test VM | pass |
+| 2026-10-27 | manual 7 (uninstall refused with profiles; keeps config.toml; reinstall uses it; --purge leaves nothing; Docker keeps running) | test VM | pass |
+| | a full provider request through iron-proxy (needs a real API key); manual 8 live on other distributions (containers: pass) | | **not done** |

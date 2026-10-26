@@ -86,7 +86,9 @@ functions are added, removed or change their job. Architecture: [ARCHITECTURE.md
 | `hermes_home(home, profile)` | `~/.hermes` or `~/.hermes/profiles/P`. |
 | `hermes_profiles(user)` | Profiles of a user (incl. `default`). |
 | `hermes(*arguments)` | Run the Hermes CLI. |
-| `terminal_settings(profile)` | `hermes -p P config get terminal --json`. |
+| `config_section(profile, section)` | `hermes -p P config get SECTION --json`. |
+| `terminal_settings(profile)` | The `terminal` section. |
+| `egress_enforced(profile)` | Hermes egress proxy enabled with `enforce_on_docker` (refuses `--network=`)? |
 | `container_label(profile, key)` | The `hermes-profile` label Hermes gives the profile's containers. |
 | `firewall_arg(argument)` | Is it an own `--network=`/`--net=`/`--dns=` entry? Refuses split `--network VALUE`. |
 | `hermes_info(profile)` | Checks (Docker backend, no shared sandbox), shared key and hints (incl. sandbox escapes). |

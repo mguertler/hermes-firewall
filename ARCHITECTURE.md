@@ -112,8 +112,10 @@ session, output stripped of control characters and not trusted), which uses the
 Hermes CLI (`hermes -p P config get terminal --json`, `config set ...`,
 `plugins enable|disable`). Hermes' `config set` keeps comments in `config.yaml`.
 
-- `info`: refuses profiles without `terminal.backend: docker` and profiles that share one
-  sandbox (`docker_shared_container_key` used by another profile of the user); returns
+- `info`: refuses profiles without `terminal.backend: docker`, profiles whose Hermes
+  egress proxy enforces its own Docker rules (`proxy.enabled` with
+  `proxy.enforce_on_docker`: Hermes then refuses any `--network=` and the sandbox would
+  not start; the fix is the user's choice) and profiles that share one sandbox (`docker_shared_container_key` used by another profile of the user); returns
   the shared key and hints (e.g. `docker_mount_cwd_to_workspace`, `--privileged`,
   `docker.sock`). Root computes the container label from the key itself
   (`container_label`) and refuses a label another protected profile already uses.

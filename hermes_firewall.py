@@ -811,14 +811,27 @@ def hermes(*arguments):
     return result.stdout
 
 
-def terminal_settings(profile):
-    output = hermes("-p", profile, "config", "get", "terminal", "--json")
+def config_section(profile, section):
+    output = hermes("-p", profile, "config", "get", section, "--json")
     try:
         settings = json.loads(output)
     except ValueError:
-        raise FirewallError(f"Unexpected output of 'hermes -p {profile} config get terminal --json'.") from None
-    require(type(settings) is dict, f"Unexpected terminal settings of Hermes profile {profile}.")
+        raise FirewallError(f"Unexpected output of 'hermes -p {profile} config get {section} --json'.") from None
+    require(type(settings) is dict, f"Unexpected {section} settings of Hermes profile {profile}.")
     return settings
+
+
+def terminal_settings(profile):
+    return config_section(profile, "terminal")
+
+
+def egress_enforced(profile):
+    """Hermes' egress proxy with enforce_on_docker refuses any --network= in docker_extra_args."""
+    try:
+        proxy = config_section(profile, "proxy")
+    except FirewallError:
+        return False  # no proxy section: proxy not configured
+    return bool(proxy.get("enabled")) and proxy.get("enforce_on_docker", True) is not False
 
 
 def container_label(profile, key=""):
@@ -844,6 +857,10 @@ def hermes_info(profile):
     require(backend == "docker",
             f"Hermes profile {profile} does not use a Docker sandbox (terminal.backend: {backend}), "
             f"so there is nothing to protect.\nTo use one: hermes -p {profile} config set terminal.backend docker")
+    require(not egress_enforced(profile),
+            f"The Hermes egress proxy of {profile} refuses sandbox networks (proxy.enforce_on_docker), so its "
+            "sandbox would not start behind hermes-firewall. The proxy keeps protecting your API keys without it.\n"
+            f"To use both: hermes -p {profile} config set proxy.enforce_on_docker false")
     key = settings.get("docker_shared_container_key") or ""
     if key:
         user = pwd.getpwuid(os.geteuid())
@@ -1006,12 +1023,12 @@ def protect_sandboxes(profile, record, conf, interactive=False, yes=False):
                 run("docker", "rm", "-f", container["Id"])
                 messages.append(f"{profile}: the sandbox was reset.")
                 continue
+        # add without a terminal cannot ask: then the fix is add --yes, not the same command again.
+        fix = f"sudo hermes-firewall add {profile}" + (" --yes" if interactive and not sys.stdin.isatty() else "")
         if mode == "host" or mode.startswith("container:"):
-            messages.append(f"{profile}: WARNING - a sandbox of this profile is NOT protected ({reason}). "
-                            f"Fix: sudo hermes-firewall add {profile}")
+            messages.append(f"{profile}: WARNING - a sandbox of this profile is NOT protected ({reason}). Fix: {fix}")
         else:
-            messages.append(f"{profile}: a sandbox of this profile needs a reset ({reason}). "
-                            f"Fix: sudo hermes-firewall add {profile}")
+            messages.append(f"{profile}: a sandbox of this profile needs a reset ({reason}). Fix: {fix}")
     return messages
 
 

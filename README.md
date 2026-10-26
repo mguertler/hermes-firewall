@@ -84,6 +84,10 @@ In a chat of a protected profile, `/firewall` does the same for that profile:
 | `all`      | yes | yes      | yes         | yes              | no              |
 
 The only exception for the host: the Hermes egress proxy (iron-proxy), if it runs.
+It runs on the host, outside the firewall, so in every state sandboxes reach what
+iron-proxy itself allows (its allow list of AI provider APIs). To combine both, Hermes
+must accept the firewall network: `hermes -p PROFILE config set proxy.enforce_on_docker false`
+(`add` says so; the proxy keeps protecting your API keys).
 
 ## Settings
 

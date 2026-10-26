@@ -534,10 +534,29 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(fw.lease_remaining("research", "lan"), 2472)
 
 
+EGRESS_ENFORCED = fw.egress_enforced  # the real function; other tests replace it
+
+
 class HermesSideTests(unittest.TestCase):
+    def setUp(self):
+        item = patch.object(fw, "egress_enforced", return_value=False)
+        item.start()
+        self.addCleanup(item.stop)
+
     def settings(self, **values):
         return {"backend": "docker", "docker_network": True, "docker_extra_args": [],
                 "docker_shared_container_key": "", **values}
+
+    def test_info_explains_the_enforcing_egress_proxy(self):
+        sections = {"terminal": self.settings(), "proxy": {"enabled": True}}
+        with patch.object(fw, "config_section", side_effect=lambda p, name: sections[name]), \
+             patch.object(fw, "egress_enforced", EGRESS_ENFORCED):
+            with self.assertRaisesRegex(fw.FirewallError, "config set proxy.enforce_on_docker false"):
+                fw.hermes_info("research")
+            sections["proxy"] = {"enabled": True, "enforce_on_docker": False}
+            self.assertEqual(fw.hermes_info("research")["hints"], [])
+            sections["proxy"] = {"enabled": False}
+            fw.hermes_info("research")
 
     def test_info_requires_docker_backend(self):
         with patch.object(fw, "terminal_settings", return_value=self.settings(backend="local")):
@@ -663,6 +682,14 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(messages[-1], "research: the sandbox was reset.")
         self.assertIn("your files in /root, /workspace", fw.kept_text(moved))
         self.assertIn("everything inside the sandbox", fw.kept_text(container()))
+
+    def test_add_without_terminal_points_to_yes(self):
+        with patch.object(fw, "sandboxes", return_value=[container(mode="none", networks=("none",))]), \
+             patch.object(fw, "run", return_value=result()), patch("sys.stdin.isatty", return_value=False):
+            interactive = fw.protect_sandboxes("research", record(label="research"), CONF, interactive=True)
+            plain = fw.protect_sandboxes("research", record(label="research"), CONF)
+        self.assertTrue(interactive[0].endswith("Fix: sudo hermes-firewall add research --yes"))
+        self.assertTrue(plain[0].endswith("Fix: sudo hermes-firewall add research"))
 
     def test_no_reset_without_confirmation(self):
         _, calls = self.protect(container(mode="none", networks=("none",)), interactive=True, answer="")
