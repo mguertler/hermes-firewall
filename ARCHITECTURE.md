@@ -32,12 +32,15 @@ nft table `inet hermes_fw_` + `d[:12]`, IPv6 subnet `fdXX:XXXX:XXXX::/64` from `
 
 Registry `profiles.json`: `{"version": 2, "profiles": {NAME: {"user", "ipv6", "label", "dns"}}}`.
 `user` is the Hermes user (from `SUDO_USER` at `add`), `ipv6` whether the network has
-IPv6 (decided at `add`), `label` the `hermes-profile` label Hermes puts on this profile's
+IPv6 (decided at `add`; `ipv6 = "auto"` only if the host has an IPv6 default route AND
+Docker masquerades IPv6, `docker_nat66`: Docker >= 27 or `ip6tables` in daemon.json;
+without NAT66 the ULA addresses would never get an answer), `label` the `hermes-profile` label Hermes puts on this profile's
 containers, `dns` the DNS servers last written into the profile. Leases are never stored.
 
 ## nft table
 
-Created by `rules(profile, sets)`. Lease sets `open_internet` and `open_lan` (type
+Created by `rules(profile, sets)`; it starts with `drop_table` (`table` + `delete
+table`, which works with every nft version, unlike `destroy table` from nft 1.0.8). Lease sets `open_internet` and `open_lan` (type
 ifname, `flags timeout`, size 1) hold the bridge name while a lease is open; the kernel
 removes it when the timeout runs out. Address sets (`SETS`), all refreshed at runtime:
 `lan_v4/v6`, `dns_v4/v6`, `allow_v4/v6` (all ports), `allow_ports_v4/v6`

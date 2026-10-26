@@ -481,6 +481,11 @@ def profile_sets(record, common, proxies):
 
 # --- nftables ------------------------------------------------------------------------------
 
+def drop_table(table):
+    """Delete a table if it exists, in any nft version ("destroy table" needs nft >= 1.0.8)."""
+    return f"table inet {table}\ndelete table inet {table}\n"
+
+
 def elements(items):
     return f"elements = {{ {', '.join(items)} }}" if items else ""
 
@@ -491,8 +496,7 @@ def rules(profile, sets=None):
     table, bridge = item["table"], item["bridge"]
     declarations = "".join(f"    set {name} {{\n        type {kind};{flags}\n        {elements(sets.get(name, ()))}\n    }}\n"
                            for name, kind, flags in SETS)
-    return f'''destroy table inet {table}
-table inet {table} {{
+    return drop_table(table) + f'''table inet {table} {{
     comment "hermes-firewall {VERSION}"
     set open_internet {{ type ifname; flags timeout; timeout 1h; size 1; }}
     set open_lan {{ type ifname; flags timeout; timeout 1h; size 1; }}
@@ -963,8 +967,10 @@ def sandboxes(label):
 def kept_text(container):
     folders = sorted({m["Destination"] for m in container.get("Mounts") or []
                       if m.get("Type") in ("bind", "volume") and m.get("RW", True)})
-    files = f"your files in {', '.join(folders)}; " if folders else ""
-    return f"  Kept:  {files}chats, memory, skills, settings\n" \
+    if not folders:
+        return "  Kept:  chats, memory, skills, settings\n" \
+               "  Lost:  everything inside the sandbox (files and installed programs)"
+    return f"  Kept:  your files in {', '.join(folders)}; chats, memory, skills, settings\n" \
            "  Lost:  programs installed inside the sandbox and files stored elsewhere in it"
 
 
@@ -1046,10 +1052,24 @@ def record_of(data, profile):
     return data["profiles"][profile]
 
 
+def docker_nat66(daemon_json=Path("/etc/docker/daemon.json")):
+    """Does Docker masquerade IPv6 of bridge networks? Default since Docker 27 ("ip6tables")."""
+    version = run("docker", "info", "--format", "{{.ServerVersion}}").stdout.strip()
+    major = int(re.match(r"(\d+)", version)[1]) if re.match(r"\d+", version) else 0
+    try:
+        daemon = json.loads(daemon_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        daemon = {}
+    if "ip6tables" in daemon:
+        return bool(daemon["ip6tables"]) and (major >= 27 or bool(daemon.get("experimental")))
+    return major >= 27
+
+
 def ipv6_enabled(conf):
+    """ipv6 = "auto": only if the host has IPv6 Internet AND Docker translates it (else it never arrives)."""
     if conf["ipv6"] != "auto":
         return conf["ipv6"]
-    return bool(json.loads(run("ip", "-j", "-6", "route", "show", "default").stdout or "[]"))
+    return bool(json.loads(run("ip", "-j", "-6", "route", "show", "default").stdout or "[]")) and docker_nat66()
 
 
 def create_firewall(data, profile, record, conf):
@@ -1087,8 +1107,9 @@ def add_profile(data, profile, user, yes=False):
             f"{profile} is protected for user {existing and existing['user']}; run add as that user.")
     conf = load_config()
     # The last line: login shells may print their own greetings first.
+    answer = as_user(user, "info", profile)  # its own errors (e.g. no Docker backend) pass through
     try:
-        info = json.loads((as_user(user, "info", profile).strip().splitlines() or [""])[-1])
+        info = json.loads((answer.strip().splitlines() or [""])[-1])
         require(type(info) is dict and type(info.get("key")) is str and len(info["key"]) <= 256
                 and type(info.get("hints")) is list and all(type(h) is str for h in info["hints"]), "")
     except (ValueError, FirewallError):
@@ -1135,7 +1156,7 @@ def remove_profile(data, profile):
         # Never delete protection until the associated network is gone.
         run("docker", "network", "rm", item["network"])
     require(not interface_exists(item["bridge"]), f"Bridge still exists: {item['bridge']}; protection kept.")
-    nft_apply(f"destroy table inet {item['table']}\n")
+    nft_apply(drop_table(item["table"]))
     del data["profiles"][profile]
     save_registry(data)
     write_sudoers(data)
@@ -1248,12 +1269,14 @@ def flush_warnings():
                              "this firewall until the next refresh (at most 5 minutes, then closed).")
         except OSError:
             continue
-    try:
-        sudoers = Path("/etc/sudoers").read_text(encoding="utf-8")
-        if not re.search(r"^[@#]includedir\s+/etc/sudoers\.d", sudoers, re.M):
-            found.append("WARNING: /etc/sudoers does not include /etc/sudoers.d; /firewall in Hermes will not work.")
-    except OSError:
-        pass
+    # openSUSE keeps the main file in /usr/etc/sudoers.
+    for name in ("/etc/sudoers", "/usr/etc/sudoers"):
+        try:
+            if not re.search(r"^[@#]includedir\s+/etc/sudoers\.d", Path(name).read_text(encoding="utf-8"), re.M):
+                found.append(f"WARNING: {name} does not include /etc/sudoers.d; /firewall in Hermes will not work.")
+            break
+        except OSError:
+            continue
     return found
 
 

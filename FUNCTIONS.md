@@ -45,6 +45,7 @@ functions are added, removed or change their job. Architecture: [ARCHITECTURE.md
 
 | Function | Job |
 |---|---|
+| `drop_table(table)` | Delete a table if it exists, in one transaction, with any nft version. |
 | `elements(items)` | `elements = { ... }` or nothing. |
 | `rules(profile, sets)` | The whole table of a profile (closed). |
 | `chain_rules(text)` | `{chain: [rules]}` of a table text; used by `health` and tests. |
@@ -110,7 +111,8 @@ functions are added, removed or change their job. Architecture: [ARCHITECTURE.md
 | Function | Job |
 |---|---|
 | `record_of(data, profile)` | Registry entry or a "not protected" error. |
-| `ipv6_enabled(conf)` | `ipv6` setting; `auto` = the host has an IPv6 default route. |
+| `docker_nat66(daemon_json)` | Does Docker masquerade IPv6 (Docker >= 27 or `ip6tables` in daemon.json)? |
+| `ipv6_enabled(conf)` | `ipv6` setting; `auto` = the host has an IPv6 default route and Docker NAT66. |
 | `create_firewall(...)` / `create_network(...)` | Table first (registry persisted), then the Docker network. |
 | `add_profile(data, profile, user, yes)` | `add`. |
 | `remove_profile(data, profile)` | `remove`. |

@@ -30,6 +30,7 @@ class PluginTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 answer, run = self.run_handle(raw)
                 self.assertEqual(run.call_args.args[0], ["sudo", "-n", plugin.EXE, words[0], "research", *words[1:]])
+                self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
                 self.assertEqual(answer, "research: firewall active, Internet closed, LAN closed")
 
     def test_anything_else_shows_usage_without_calling_sudo(self):

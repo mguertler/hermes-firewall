@@ -164,7 +164,7 @@ class AddressTests(unittest.TestCase):
     def test_host_networks_ignore_virtual_and_public(self):
         links = [{"ifname": "lo", "addr_info": [{"family": "inet", "local": "127.0.0.1", "prefixlen": 8, "scope": "host"}]},
                  {"ifname": "eth0", "addr_info": [
-                     {"family": "inet", "local": "192.168.0.87", "prefixlen": 24, "scope": "global"},
+                     {"family": "inet", "local": "192.168.0.20", "prefixlen": 24, "scope": "global"},
                      {"family": "inet", "local": "93.184.0.87", "prefixlen": 24, "scope": "global"},
                      {"family": "inet6", "local": "2a01:4f8:1:2::87", "prefixlen": 64, "scope": "global"},
                      {"family": "inet6", "local": "fe80::1", "prefixlen": 64, "scope": "link"}]},
@@ -460,7 +460,7 @@ class ProfileTests(unittest.TestCase):
                  patch.object(fw, "save_registry"), patch.object(fw, "write_sudoers"), patch("builtins.print"):
                 fw.remove_profile(data, "research")
         self.assertEqual(order[:3], [("detach", "research"), "disconnect", "rm"])
-        self.assertEqual(order[3], f"destroy table inet {fw.identity('research')['table']}\n")
+        self.assertEqual(order[3], fw.drop_table(fw.identity("research")["table"]))
         self.assertEqual(set(data["profiles"]), {"work"})
 
     def test_add_refuses_answers_it_cannot_trust_and_label_clashes(self):
@@ -469,6 +469,10 @@ class ProfileTests(unittest.TestCase):
                 with self.subTest(answer=answer), patch.object(fw, "load_config", return_value=CONF), \
                      patch.object(fw, "as_user", return_value=answer), self.assertRaisesRegex(fw.FirewallError, "Unexpected"):
                     fw.add_profile(registry(), "research", user)
+            with patch.object(fw, "load_config", return_value=CONF), \
+                 patch.object(fw, "as_user", side_effect=fw.FirewallError("does not use a Docker sandbox")), \
+                 self.assertRaisesRegex(fw.FirewallError, "Docker sandbox"):
+                fw.add_profile(registry(), "research", user)
             data = registry("work")
             data["profiles"]["work"]["label"] = "research"
             with patch.object(fw, "load_config", return_value=CONF), \
@@ -500,6 +504,22 @@ class ProfileTests(unittest.TestCase):
             with self.assertRaises(fw.FirewallError):
                 fw.status(registry("research"), selected="research")
         self.assertIn("network is missing. Fix: sudo hermes-firewall add research", output.call_args.args[0])
+
+    def test_ipv6_auto_needs_docker_nat66(self):
+        with tempfile.TemporaryDirectory() as directory:
+            daemon = Path(directory) / "daemon.json"
+            for version, setting, expected in (("29.0.1", None, True), ("26.1.5+dfsg1", None, False),
+                                               ("26.1.5", {"ip6tables": True}, False),
+                                               ("26.1.5", {"ip6tables": True, "experimental": True}, True),
+                                               ("28.0.0", {"ip6tables": False}, False)):
+                with self.subTest(version=version, setting=setting):
+                    daemon.write_text(json.dumps(setting)) if setting else daemon.unlink(missing_ok=True)
+                    with patch.object(fw, "run", return_value=result(version + "\n")):
+                        self.assertEqual(fw.docker_nat66(daemon), expected)
+        with patch.object(fw, "run", return_value=result('[{"dst": "default"}]')), \
+             patch.object(fw, "docker_nat66", return_value=False):
+            self.assertFalse(fw.ipv6_enabled({"ipv6": "auto"}))
+            self.assertTrue(fw.ipv6_enabled({"ipv6": True}))
 
     def test_left(self):
         self.assertEqual([fw.left(s) for s in (30, 59, 60, 2472, 3600, 7380)], ["30s", "59s", "1m", "41m", "1h", "2h 03m"])
@@ -642,6 +662,7 @@ class SandboxTests(unittest.TestCase):
         self.assertIn(("docker", "rm", "-f", "c1"), calls)
         self.assertEqual(messages[-1], "research: the sandbox was reset.")
         self.assertIn("your files in /root, /workspace", fw.kept_text(moved))
+        self.assertIn("everything inside the sandbox", fw.kept_text(container()))
 
     def test_no_reset_without_confirmation(self):
         _, calls = self.protect(container(mode="none", networks=("none",)), interactive=True, answer="")
@@ -740,12 +761,12 @@ class InstallTests(unittest.TestCase):
                     with patch.object(fw, "health", side_effect=None if healthy else fw.FirewallError("old")), \
                          patch.object(fw, "nft_apply") as nft, patch.object(fw, "write_sudoers"), \
                          patch.object(fw, "all_sets", return_value={"research": {}}), \
-                         patch.object(fw, "restore_transaction", return_value="destroy table\n"), \
+                         patch.object(fw, "restore_transaction", return_value="delete table\n"), \
                          patch.object(fw, "as_user") as as_user, patch.object(fw.pwd, "getpwnam", return_value=USER):
                         fw.upgrade(self.bundle(base))
                     self.assertEqual(fw.UNIT.read_text(), fw.UNIT_TEXT)
                 text = nft.call_args.args[0]
-                self.assertEqual("destroy table" in text, not healthy)
+                self.assertEqual("delete table" in text, not healthy)
                 as_user.assert_called_once_with(USER, "attach", "research")
 
     def test_upgrade_refuses_missing_installation(self):

@@ -48,28 +48,30 @@ PY
 echo '2. OPEN internet 30s: HTTPS works, then the kernel closes the lease, also for open connections.'
 hermes-firewall open "$profile" 30s
 sandbox <<'PY'
-import socket, time, urllib.request
+import http.client, socket, time, urllib.request
 with urllib.request.urlopen("https://example.com/", timeout=8) as response:
     assert response.read(1), "Empty HTTPS response"
 print("PASS: HTTPS works while OPEN", flush=True)
-connection = socket.create_connection((socket.gethostbyname("example.com"), 80), timeout=3)
 try:
     socket.create_connection(("2606:4700:4700::1111", 443), timeout=3).close()
     print("INFO: IPv6 Internet reachable", flush=True)
 except OSError:
-    print("INFO: no IPv6 Internet from the sandbox (ipv6 off or host without IPv6)", flush=True)
+    print("INFO: no IPv6 Internet from the sandbox (ipv6 off, host or Docker without IPv6 NAT)", flush=True)
+# A keep-alive connection that the server keeps open: the same connection must die with the lease.
+connection = http.client.HTTPConnection("example.com", 80, timeout=4)
+connection.request("GET", "/", headers={"Connection": "keep-alive"})
+connection.getresponse().read()
 print("Waiting 32s for the lease to expire ...", flush=True)
 time.sleep(32)
-connection.settimeout(3)
 try:
-    connection.sendall(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
-    payload = connection.recv(1024)
-except socket.timeout:
+    connection.request("GET", "/", headers={"Connection": "keep-alive"})
+    connection.getresponse().read()
+except (socket.timeout, TimeoutError):
     print("PASS: the open connection gets no answer after expiry", flush=True)
+except (http.client.RemoteDisconnected, ConnectionError) as error:
+    raise SystemExit(f"INCONCLUSIVE: the server closed the connection ({error}); run the test again")
 else:
-    raise SystemExit("FAIL/INCONCLUSIVE: expected a timeout, received %r" % payload[:80])
-finally:
-    connection.close()
+    raise SystemExit("FAIL: the open connection still works after expiry")
 try:
     socket.create_connection(("1.1.1.1", 443), timeout=3).close()
 except OSError:
@@ -92,4 +94,4 @@ else:
     raise SystemExit("FAIL: the host is reachable from the sandbox")
 PY
 hermes-firewall close "$profile"
-echo 'Network tests passed. Boot ordering and the real Hermes sandbox still need a manual check (see TESTING.md).'
+echo 'Network tests passed. The other release checks are listed in TESTING.md.'

@@ -38,8 +38,9 @@ def handle(raw_args=""):
     if profile is None:
         return "This Hermes profile is not in ~/.hermes, so /firewall cannot tell which firewall to use."
     try:
-        result = subprocess.run(["sudo", "-n", EXE, words[0], profile, *words[1:]],
-                                capture_output=True, text=True, timeout=60)
+        # LC_ALL=C: sudo's own messages in English, so a missing rule is recognised in any locale.
+        result = subprocess.run(["sudo", "-n", EXE, words[0], profile, *words[1:]], capture_output=True,
+                                text=True, timeout=60, env={**os.environ, "LC_ALL": "C"})
     except FileNotFoundError:
         return "sudo is not installed on this host."
     except subprocess.TimeoutExpired:

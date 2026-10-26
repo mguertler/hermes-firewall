@@ -28,9 +28,14 @@ Or right in a Hermes chat:
 ## Requirements
 
 Linux with systemd, nftables (kernel 5.6 or newer), the local rootful Docker and
-Python 3.11 or newer. Tested distributions: see [TESTING.md](TESTING.md); intended
-for Debian/Ubuntu, Fedora/RHEL, Arch and openSUSE. Hermes Agent with the Docker
-terminal backend (`terminal.backend: docker`).
+Python 3.11 or newer; Hermes Agent with the Docker terminal backend
+(`terminal.backend: docker`). Checked on Debian 12 and 13, Ubuntu 24.04, Fedora 42,
+Arch Linux and openSUSE Tumbleweed; tested live on Debian 13 with Hermes Agent 0.22.5
+(details: [TESTING.md](TESTING.md)).
+
+IPv6 for sandboxes needs Docker 27 or newer (or `"ip6tables": true` with
+`"experimental": true` in `/etc/docker/daemon.json` on Docker 26, as in Debian 13);
+otherwise sandboxes get IPv4 only.
 
 ## Install
 
