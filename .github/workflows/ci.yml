@@ -1,0 +1,18 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nftables shellcheck
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Packet test (no root)
+        run: NFT=$(command -v nft) bash tests/netns.sh
+      - name: Shellcheck
+        run: shellcheck install.sh uninstall.sh tests/*.sh

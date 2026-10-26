@@ -1,0 +1,45 @@
+# hermes-firewall settings: /etc/hermes-firewall/config.toml
+# The installer writes this file once (with the DNS servers it detected);
+# upgrades never change it. After editing: sudo hermes-firewall refresh
+# (changes reach the sandboxes within 5 minutes anyway; open leases stay open).
+
+# IPv6 for the sandboxes: "auto" = only if this host has IPv6 Internet access.
+# Decided when a profile is added; later changes need remove + add.
+ipv6 = "auto"
+
+# true: Docker does not start at all if the firewall cannot be loaded at boot
+# (safe for a dedicated Hermes host). false: Docker always starts; use it only
+# if other important containers run here, and watch 'hermes-firewall status'.
+docker_requires_firewall = true
+
+[lease]
+default = "1h"     # "open PROFILE" without a duration
+max = "24h"        # longest lease, also for /firewall in Hermes (at most 24h)
+
+[sandbox]
+# DNS servers of the sandboxes. They are reachable in EVERY state (port 53 only),
+# so names always resolve. Residual risk: code in a closed sandbox could leak
+# small amounts of data through DNS queries to these servers.
+dns = ["9.9.9.9", "149.112.112.112"]
+
+[lan]
+# What "open PROFILE lan" opens. "auto" = the networks this host is directly
+# connected to (private IPv4, IPv6 prefixes), refreshed every 5 minutes.
+networks = ["auto"]
+# Host names whose current addresses also count as LAN (resolved with the
+# sandbox DNS servers above), for example a NAS with a public address.
+hosts = []
+
+[hermes]
+# Let sandboxes reach the Hermes egress proxy (iron-proxy) on this host, if it runs.
+egress_proxy = true
+
+# Always reachable, in every state: addresses or networks, IPv4 or IPv6,
+# optionally only some ports. Without tcp/udp: all ports. Examples:
+#
+# [[allow]]
+# net = "192.168.1.20"       # a wiki on the LAN
+# tcp = [443]
+#
+# [[allow]]
+# net = "203.0.113.0/24"     # a package mirror
