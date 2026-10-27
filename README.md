@@ -58,6 +58,18 @@ when they start: restart the gateway (`hermes -p default gateway restart`, for T
 Discord, ...) and the backend of the desktop app (`hermes -p default dashboard --stop`,
 then start it again), then start a new chat.
 
+Optional, per profile (off by default): tell the agent when the firewall blocked a command.
+
+```bash
+hermes -p default config set plugins.entries.hermes-firewall.settings.agent_notice true
+```
+
+Then a sandbox command that fails with a network error while the firewall is closed
+gets one line appended to its output: what is closed and that only the user can open
+it with `/firewall`, so the model asks instead of guessing or trying to work around it.
+Nothing is added to the prompt or to any other output, and the model still cannot open
+anything. Switching it on or off needs no restart once the plugin is loaded.
+
 ## Usage
 
 ```text
@@ -81,19 +93,6 @@ only built-in and skill commands, no plugin commands. Telegram's `/` menu holds 
 commands and Hermes' own fill it; to list `/firewall` there too:
 `hermes -p PROFILE config set platforms.telegram.extra.command_menu.priority '["firewall"]'`
 and restart the gateway.
-
-**Optional: tell the agent.** By default the model only sees the bare network error
-of a command in a closed sandbox. With
-
-```bash
-hermes -p PROFILE config set plugins.entries.hermes-firewall.settings.agent_notice true
-```
-
-a sandbox command that fails with a network error while the firewall is closed gets one
-line appended to its output: what is closed and that only the user can open it with
-`/firewall`, so the model asks instead of guessing or trying to work around it.
-Nothing is added to the prompt or to any other output; the model still cannot open
-anything. It takes effect without a restart once the plugin is loaded.
 
 ### What a sandbox can reach
 
