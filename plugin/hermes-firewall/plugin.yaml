@@ -2,3 +2,5 @@ name: hermes-firewall
 version: 2.0.0
 description: "/firewall: open, close and show the sandbox firewall of this profile (needs hermes-firewall on the host)."
 author: hermes-firewall contributors
+provides_hooks:
+  - transform_terminal_output

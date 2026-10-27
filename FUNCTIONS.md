@@ -138,5 +138,10 @@ functions are added, removed or change their job. Architecture: [ARCHITECTURE.md
 | Function | Job |
 |---|---|
 | `profile_name()` | This gateway's profile from `HERMES_HOME`. |
-| `handle(raw_args)` | `/firewall open|close|status ...` -> `sudo -n hermes-firewall VERB PROFILE ...`. |
-| `register(ctx)` | Registers the slash command `/firewall`. |
+| `firewall(verb, profile, *words)` | `sudo -n hermes-firewall VERB PROFILE ...` with `LC_ALL=C`. |
+| `handle(raw_args)` | `/firewall open|close|status ...` for this profile. |
+| `network_failure(command, output, returncode)` | Did a command fail with a typical network error? |
+| `lease_states(profile)` | Internet/LAN state from `status PROFILE`, or `None`. |
+| `notice(states)` | The one line added for the model. |
+| `make_output_hook(enabled)` | `transform_terminal_output` hook of the optional agent notice. |
+| `register(ctx)` | Registers `/firewall` and the (setting-gated) output hook. |

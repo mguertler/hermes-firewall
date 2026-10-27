@@ -160,7 +160,13 @@ All root commands take the global lock; a command waits at most 2 minutes for it
 `plugin/hermes-firewall/__init__.py` registers the slash command `/firewall` (not a tool,
 so the model cannot call it). It finds its profile from `HERMES_HOME`
 (`hermes_cli.profiles.get_active_profile_name`) and runs
-`sudo -n /usr/local/bin/hermes-firewall open|close|status PROFILE ...`. `write_sudoers()`
+`sudo -n /usr/local/bin/hermes-firewall open|close|status PROFILE ...`. With the plugin setting
+`agent_notice: true` it also registers a `transform_terminal_output` hook: only for a
+Docker sandbox command that failed (`returncode` != 0) with a typical network error
+(curl exit 6/7/28/35/56, resolver/connect/timeout messages of curl, wget, git, pip, npm,
+apt) it asks `status PROFILE` and, if a lease is closed, appends one line naming the
+closed kinds and `/firewall open`. Off, it returns before any work; it never touches
+successful or other output and never the prompt. `write_sudoers()`
 generates one NOPASSWD line per protected profile with exactly `open P`, `open P *`,
 `close P`, `close P *` and `status P`, validated with `visudo -cf`. Because of the
 wildcards, `open` and `close` accept no options at all (`parse`).

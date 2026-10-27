@@ -43,6 +43,10 @@ These must stay true. Change them only deliberately, together with tests and doc
   profile's Hermes labels.
 - Files are removed only when known to be ours: plugin files by name, no recursive
   deletion; `uninstall` refuses unknown files and remaining networks/tables.
+- The model never gets a way to open the firewall: `/firewall` is a slash command (user
+  only), no tool. The optional agent notice (`agent_notice`, off by default) only adds
+  one line to the output of a sandbox command that failed with a network error while a
+  lease is closed; never to the prompt or to other output.
 - sudoers allows exactly `open`, `close` and `status` of protected profiles. Those verbs
   accept no options. `visudo -cf` validates every sudoers file before it is installed.
 

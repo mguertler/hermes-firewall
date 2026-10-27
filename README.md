@@ -82,6 +82,19 @@ commands and Hermes' own fill it; to list `/firewall` there too:
 `hermes -p PROFILE config set platforms.telegram.extra.command_menu.priority '["firewall"]'`
 and restart the gateway.
 
+**Optional: tell the agent.** By default the model only sees the bare network error
+of a command in a closed sandbox. With
+
+```bash
+hermes -p PROFILE config set plugins.entries.hermes-firewall.settings.agent_notice true
+```
+
+a sandbox command that fails with a network error while the firewall is closed gets one
+line appended to its output: what is closed and that only the user can open it with
+`/firewall`, so the model asks instead of guessing or trying to work around it.
+Nothing is added to the prompt or to any other output; the model still cannot open
+anything. It takes effect without a restart once the plugin is loaded.
+
 ### What a sandbox can reach
 
 | Lease      | LAN | Internet | DNS servers | `[[allow]]` list | the host itself |

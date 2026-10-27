@@ -94,4 +94,5 @@ Not covered automatically; record the result (distribution, versions, date) belo
 | 2026-10-27 | manual 5 (IPv6 with Docker CE 29.9.2: LAN global + ULA and Internet per lease, host blocked; integration.sh with IPv6) | test VM | pass |
 | 2026-10-27 | manual 6 (iron-proxy 0.39.0: add explains enforce_on_docker; tunnel and HTTP port reachable while closed, management port and other host ports blocked; same proxy answers with and without firewall) | test VM | pass |
 | 2026-10-27 | manual 7 (uninstall refused with profiles; keeps config.toml; reinstall uses it; --purge leaves nothing; Docker keeps running) | test VM | pass |
+| 2026-10-27 | agent notice: off = untouched output; on = one line on curl timeout with closed firewall, model (ministral-3:8b) then asks for `/firewall open`; needs a fresh gateway after plugin updates | test VM | pass |
 | | a full provider request through iron-proxy (needs a real API key); manual 8 live on other distributions (containers: pass) | | **not done** |

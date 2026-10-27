@@ -17,6 +17,76 @@ def result(output="", code=0, error=""):
     return subprocess.CompletedProcess([], code, output, error)
 
 
+class Context:
+    """The parts of Hermes' PluginContext the plugin uses."""
+    def __init__(self, settings=None):
+        self.commands, self.hooks, self.settings = [], [], settings or {}
+
+    def register_command(self, name, handler, description="", args_hint=""):
+        self.commands.append((name, handler))
+
+    def register_hook(self, name, callback):
+        self.hooks.append((name, callback))
+
+    def get_config(self, key, default=None):
+        return self.settings.get(key, default)
+
+
+CLOSED = result("research: firewall active, Internet closed, LAN closed\n")
+OPEN = result("research: firewall active, Internet open for 41m (until 14:32), LAN open for 41m (until 14:32)\n")
+
+
+class AgentNoticeTests(unittest.TestCase):
+    def hook(self, settings):
+        ctx = Context(settings)
+        plugin.register(ctx)
+        return dict(ctx.hooks)["transform_terminal_output"]
+
+    def call(self, hook, status=CLOSED, **kwargs):
+        args = {"command": "curl -s https://example.com", "output": "", "returncode": 28, "env_type": "docker",
+                "task_id": "t", "tool_call_id": "c", **kwargs}
+        with patch.object(plugin, "profile_name", return_value="research"), \
+             patch.object(plugin.subprocess, "run", return_value=status) as run:
+            return hook(**args), run
+
+    def test_off_by_default_and_costs_nothing(self):
+        answer, run = self.call(self.hook({}))
+        self.assertIsNone(answer)
+        run.assert_not_called()
+
+    def test_network_failure_on_closed_firewall_gets_one_line(self):
+        hook = self.hook({"agent_notice": True})
+        for command, output, code in (("curl -s https://example.com", "", 28),
+                                      ("pip install requests", "Failed to establish a new connection", 1),
+                                      ("git clone https://github.com/x/y", "fatal: unable to access 'https://github.com/x/y/': "
+                                                                          "Failed to connect to github.com port 443", 128),
+                                      ("npm install", "npm ERR! code ETIMEDOUT", 1)):
+            with self.subTest(command=command):
+                answer, run = self.call(hook, command=command, output=output, returncode=code)
+                self.assertTrue(answer.startswith(output))
+                self.assertEqual(answer.count("\n[hermes-firewall]"), 1)
+                self.assertIn("Internet closed, LAN closed", answer)
+                self.assertIn("/firewall open", answer)
+                self.assertEqual(run.call_args.args[0][:5], ["sudo", "-n", plugin.EXE, "status", "research"])
+
+    def test_everything_else_is_left_alone_without_asking_the_firewall(self):
+        hook = self.hook({"agent_notice": True})
+        for kwargs in ({"returncode": 0}, {"returncode": None}, {"env_type": "local"},
+                       {"command": "ls /nope", "output": "No such file or directory", "returncode": 2},
+                       {"command": "python3 x.py", "output": "SyntaxError", "returncode": 1}):
+            with self.subTest(kwargs=kwargs):
+                answer, run = self.call(hook, **kwargs)
+                self.assertIsNone(answer)
+                run.assert_not_called()
+
+    def test_open_or_unknown_firewall_is_not_blamed(self):
+        hook = self.hook({"agent_notice": True})
+        self.assertIsNone(self.call(hook, status=OPEN)[0])
+        self.assertIsNone(self.call(hook, status=result(code=1, error="sudo: a password is required"))[0])
+        partly = result("research: firewall active, Internet open for 5m (until 14:00), LAN closed\n")
+        self.assertIn("Internet open for 5m (until 14:00), LAN closed", self.call(hook, status=partly)[0])
+
+
 class PluginTests(unittest.TestCase):
     def run_handle(self, raw, output=result("research: firewall active, Internet closed, LAN closed\n")):
         with patch.object(plugin, "profile_name", return_value="research"), \
@@ -63,14 +133,11 @@ class PluginTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_registers_a_slash_command_not_a_tool(self):
-        class Context:
-            def __init__(self):
-                self.commands = []
-            def register_command(self, name, handler, description="", args_hint=""):
-                self.commands.append((name, handler))
         ctx = Context()
         plugin.register(ctx)
         self.assertEqual(ctx.commands, [("firewall", plugin.handle)])
+        self.assertEqual([name for name, _ in ctx.hooks], ["transform_terminal_output"])
+        self.assertFalse(hasattr(ctx, "tools"))
 
     def test_manifest_matches(self):
         manifest = (ROOT / "plugin" / "hermes-firewall" / "plugin.yaml").read_text()
