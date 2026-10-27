@@ -1,7 +1,6 @@
 # Functions
 
-Index of `hermes_firewall.py` (in file order) and the plugin. Keep it in sync when
-functions are added, removed or change their job. Architecture: [ARCHITECTURE.md](ARCHITECTURE.md).
+Index of `hermes_firewall.py` (in file order) and the plugin. Keep it in sync when functions are added, removed or change their job. Architecture: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Input
 

@@ -8,15 +8,7 @@ bash tests/netns.sh                          # packet test of the real rules, ne
 shellcheck install.sh uninstall.sh tests/*.sh
 ```
 
-`tests/netns.sh` runs in a private user + network namespace: the namespace plays the
-Hermes host (router + firewall, docker0 with an egress proxy), with a sandbox, a LAN and
-an Internet namespace, IPv4 and IPv6. It loads the generated rules with nft and checks
-24 targets in the states closed / lan / internet / all / closed again: LAN hosts, the
-public address of a LAN host, Internet, DNS (IPv4 and IPv6), `[[allow]]` address and
-network, other private networks, the host itself, the egress proxy, IPv6 ULA and global
-LAN prefixes, NAT64 (public, LAN and private embedded addresses) and 6to4. It must pass
-after every rule change. A quick mutation check (e.g. let `nat64()` return `[]`) shows
-that it catches bypasses.
+`tests/netns.sh` runs in a private user + network namespace: the namespace plays the Hermes host (router + firewall, docker0 with an egress proxy), with a sandbox, a LAN and an Internet namespace, IPv4 and IPv6. It loads the generated rules with nft and checks 24 targets in the states closed / lan / internet / all / closed again: LAN hosts, the public address of a LAN host, Internet, DNS (IPv4 and IPv6), `[[allow]]` address and network, other private networks, the host itself, the egress proxy, IPv6 ULA and global LAN prefixes, NAT64 (public, LAN and private embedded addresses) and 6to4. It must pass after every rule change. A quick mutation check (e.g. let `nat64()` return `[]`) shows that it catches bypasses.
 
 The CI workflow (`.github/workflows/ci.yml`) runs all three on Ubuntu.
 
@@ -27,16 +19,11 @@ sudo bash tests/distros.sh            # Debian 12/13, Ubuntu 24.04, Fedora 42, A
 sudo bash tests/distros.sh fedora:42  # or selected images
 ```
 
-Per distribution in a container: required programs at the expected paths, Python
-version, unit tests, the generated rules with its nft (`nft -c`), the sudoers file with
-its visudo, and whether sudoers includes `/etc/sudoers.d`. Not covered: systemd, Docker
-and the real packet path (live test).
+Per distribution in a container: required programs at the expected paths, Python version, unit tests, the generated rules with its nft (`nft -c`), the sudoers file with its visudo, and whether sudoers includes `/etc/sudoers.d`. Not covered: systemd, Docker and the real packet path (live test).
 
 ### Test machines
 
-Live tests need a disposable VM (root, Docker, Hermes, reboots allowed); helper hosts
-can run the distribution containers and the fast tests. Such machines are not always
-running: check first, keep the steps resumable, and run the local tests otherwise.
+Live tests need a disposable VM (root, Docker, Hermes, reboots allowed); helper hosts can run the distribution containers and the fast tests. Such machines are not always running: check first, keep the steps resumable, and run the local tests otherwise.
 
 ## Live test (root, Docker; opt-in)
 
@@ -51,8 +38,7 @@ sudo bash tests/integration.sh fwtest        # closed / open 30s / expiry / host
 sudo hermes-firewall remove fwtest
 ```
 
-For a real Hermes session a local model is enough, e.g. Ollama (Hermes needs a context
-window of at least 64K):
+For a real Hermes session a local model is enough, e.g. Ollama (Hermes needs a context window of at least 64K):
 
 ```bash
 hermes config set model.provider ollama
@@ -65,16 +51,12 @@ hermes config set model.ollama_num_ctx 64000
 
 Not covered automatically; record the result (distribution, versions, date) below.
 
-1. Boot: after a reboot `status` shows all profiles closed; Docker started after the
-   firewall; with `docker_requires_firewall = true` a broken firewall keeps Docker down.
-2. A real Hermes session (gateway + `/firewall open`, `/firewall status`, `/firewall close`)
-   and a sandbox command (`curl`) in each state.
-3. `add` on a profile with an existing persistent sandbox: it is moved; a sandbox with
-   `--network=host` asks for a reset.
+1. Boot: after a reboot `status` shows all profiles closed; Docker started after the firewall; with `docker_requires_firewall = true` a broken firewall keeps Docker down.
+2. A real Hermes session (gateway + `/firewall open`, `/firewall status`, `/firewall close`) and a sandbox command (`curl`) in each state.
+3. `add` on a profile with an existing persistent sandbox: it is moved; a sandbox with `--network=host` asks for a reset.
 4. `remove`: new sessions have no network; `add` again works.
 5. IPv6 (host with IPv6): `open` reaches IPv6 sites, closed does not.
-6. Hermes egress proxy (`hermes egress setup/start`, `proxy.enforce_on_docker false`):
-   reachable from the sandbox in every state, other host ports and its management port not.
+6. Hermes egress proxy (`hermes egress setup/start`, `proxy.enforce_on_docker false`): reachable from the sandbox in every state, other host ports and its management port not.
 7. `sudo ./install.sh` again (upgrade) keeps leases open; `uninstall.sh` and `--purge`.
 8. Distributions: Debian 13, Ubuntu 24.04, Fedora, Arch, openSUSE (install, add, open, close).
 
