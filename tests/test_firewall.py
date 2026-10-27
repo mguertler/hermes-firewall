@@ -401,6 +401,12 @@ def hermes_home(profile="research"):
 
 
 class ProfileTests(unittest.TestCase):
+    def setUp(self):
+        # Independent of the machine running the tests (on CI runners /usr/local/bin is not root-only).
+        item = patch.object(fw, "replaceable_by_others", return_value=[])
+        item.start()
+        self.addCleanup(item.stop)
+
     def add(self, data, user, existing_network=True):
         calls = []
         def as_user(u, *arguments):
