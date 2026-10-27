@@ -44,6 +44,8 @@ Index of `hermes_firewall.py` (in file order) and the plugin. Keep it in sync wh
 
 | Function | Job |
 |---|---|
+| `chains(bridge)` | The four chains of a profile table (rule layout without set contents). |
+| `layout(bridge)` | Fingerprint of that layout, stored in the table comment and checked by `health`. |
 | `drop_table(table)` | Delete a table if it exists, in one transaction, with any nft version. |
 | `elements(items)` | `elements = { ... }` or nothing. |
 | `rules(profile, sets)` | The whole table of a profile (closed). |

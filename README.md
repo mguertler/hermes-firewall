@@ -75,6 +75,8 @@ In a chat of a protected profile, `/firewall` does the same for that profile: `/
 | `internet` | no  | yes      | yes         | yes              | no              |
 | `all`      | yes | yes      | yes         | yes              | no              |
 
+Blocked connections fail at once instead of timing out: TCP connections are refused (`Connection refused`), everything else gets an ICMP "administratively prohibited" (`No route to host`). When a lease expires, open connections are reset. Traffic from outside to a sandbox is still dropped silently.
+
 The only exception for the host: the Hermes egress proxy (iron-proxy), if it runs. It runs on the host, outside the firewall, so in every state sandboxes reach what iron-proxy itself allows (its allow list of AI provider APIs). To combine both, Hermes must accept the firewall network: `hermes -p PROFILE config set proxy.enforce_on_docker false` (`add` says so; the proxy keeps protecting your API keys).
 
 ## Settings

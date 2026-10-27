@@ -30,22 +30,25 @@ sandbox() {
 }
 docker pull -q python:3.13-alpine >/dev/null
 
-echo '1. CLOSED: names resolve (DNS is always open), but no connection gets out.'
+echo '1. CLOSED: names resolve (DNS is always open), connections are refused at once.'
 hermes-firewall close "$profile"
 sandbox <<'PY'
-import socket
+import socket, time
 address = socket.gethostbyname("example.com")
 print("PASS: DNS works while CLOSED", flush=True)
 for target in ((address, 443), ("1.1.1.1", 443)):
+    start = time.monotonic()
     try:
-        socket.create_connection(target, timeout=3).close()
-    except OSError:
-        print(f"PASS: {target[0]} blocked", flush=True)
+        socket.create_connection(target, timeout=5).close()
+    except socket.timeout:
+        raise SystemExit(f"FAIL: {target[0]} timed out instead of being refused at once")
+    except OSError as error:
+        print(f"PASS: {target[0]} refused after {time.monotonic() - start:.2f}s ({error.strerror})", flush=True)
     else:
         raise SystemExit(f"FAIL: {target[0]} is reachable while CLOSED")
 PY
 
-echo '2. OPEN internet 30s: HTTPS works, then the kernel closes the lease, also for open connections.'
+echo '2. OPEN internet 30s: HTTPS works, then the kernel closes the lease and resets open connections.'
 hermes-firewall open "$profile" 30s
 sandbox <<'PY'
 import http.client, socket, time, urllib.request
@@ -66,10 +69,10 @@ time.sleep(32)
 try:
     connection.request("GET", "/", headers={"Connection": "keep-alive"})
     connection.getresponse().read()
-except (socket.timeout, TimeoutError):
-    print("PASS: the open connection gets no answer after expiry", flush=True)
-except (http.client.RemoteDisconnected, ConnectionError) as error:
+except http.client.RemoteDisconnected as error:  # a clean close by the server, not the firewall
     raise SystemExit(f"INCONCLUSIVE: the server closed the connection ({error}); run the test again")
+except (ConnectionResetError, BrokenPipeError):
+    print("PASS: the open connection was reset when the lease expired", flush=True)
 else:
     raise SystemExit("FAIL: the open connection still works after expiry")
 try:

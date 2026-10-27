@@ -68,25 +68,28 @@ threading.Event().wait()
 PY
 cat > "$work/probe.py" <<'PY'
 import socket, sys, threading
+# open = answered; blocked = refused AT ONCE (the firewall rejects); timeout = no answer at all.
 targets = [line.split() for line in sys.stdin.read().splitlines() if line.strip()]
 results = [None] * len(targets)
 def probe(index, kind, host, port):
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    s = socket.socket(family, socket.SOCK_STREAM if kind == "tcp" else socket.SOCK_DGRAM)
+    s.settimeout(1.5 if kind == "tcp" else 0.75)
     try:
-        if kind == "tcp":
-            s = socket.socket(family); s.settimeout(1.5); s.connect((host, int(port))); s.close()
-        else:
+        s.connect((host, int(port)))  # UDP too: a connected socket reports ICMP errors
+        if kind == "udp":
             # Retry once like real resolvers: the first packet may wait for neighbour discovery.
-            s = socket.socket(family, socket.SOCK_DGRAM); s.settimeout(0.75)
             for attempt in (1, 2):
-                s.sendto(b"q", (host, int(port)))
+                s.send(b"q")
                 try:
-                    s.recvfrom(64)
+                    s.recv(64)
                     break
                 except socket.timeout:
                     if attempt == 2:
                         raise
         results[index] = "open"
+    except socket.timeout:
+        results[index] = "timeout"
     except OSError:
         results[index] = "blocked"
 threads = [threading.Thread(target=probe, args=(i, *t[1:])) for i, t in enumerate(targets)]
@@ -133,7 +136,7 @@ python3 -I "$work/serve.py" >/dev/null 2>&1 & pids+=("$!")   # services on the h
 sleep 0.5
 "$NFT" -f "$work/rules.nft"
 
-# name  target  expected in: closed  open-lan  open-internet  open-all  (o = open, - = blocked)
+# name  target  expected in: closed  open-lan  open-internet  open-all\n# (o = open, - = refused at once by the firewall; a timeout is a failure)
 matrix="
 lan-host       tcp 192.168.0.10 80          - o - o
 lan-ext-addr   tcp 93.184.1.7 80            - o - o

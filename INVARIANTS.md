@@ -11,6 +11,8 @@ These must stay true. Change them only deliberately, together with tests and doc
 - IPv4 and IPv6 are filtered the same way. Addresses that embed IPv4 (NAT64, 6to4, Teredo) must never bypass the IPv4 rules.
 - Fail closed, never open: no automatic fallback to unfiltered networking, a different Docker daemon or a disabled firewall. A failed step leaves things closed.
 - Protection first: the table exists before the Docker network; the network is removed before the table. Detach leaves a sandbox with NO network, never an unfiltered one.
+- Connections a sandbox may not make are refused at once (TCP reset, otherwise ICMP admin-prohibited), never left to time out; traffic from outside to a sandbox is dropped silently.
+- Every change of the rules changes the layout fingerprint, so `upgrade` reloads the tables instead of leaving old rules in place.
 - `bash tests/netns.sh` must pass after any rule change.
 
 ## Scope of changes

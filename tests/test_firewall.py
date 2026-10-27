@@ -285,22 +285,39 @@ class RuleTests(unittest.TestCase):
         # DNS and the allow list first: reachable in every state, but only exactly those.
         self.assertTrue(all("dns_v" in r or "allow" in r for r in rules[:6]))
         position = {name: next(i for i, r in enumerate(rules) if name in r)
-                    for name in ("iifname @open_lan", "@lan_v4 counter drop", "@lan_v6 counter drop",
-                                 "@non_public_v4", "@non_public_v6", "@open_internet")}
+                    for name in ("iifname @open_lan", "@lan_v4 meta l4proto tcp counter reject",
+                                 "@lan_v6 meta l4proto tcp counter reject", "@non_public_v4", "@non_public_v6",
+                                 "@open_internet")}
         # An Internet lease never opens the LAN, private networks or NAT64-embedded private addresses.
-        for name in ("@lan_v4 counter drop", "@lan_v6 counter drop", "@non_public_v4", "@non_public_v6"):
+        for name in ("@lan_v4 meta l4proto tcp counter reject", "@lan_v6 meta l4proto tcp counter reject",
+                     "@non_public_v4", "@non_public_v6"):
             self.assertLess(position["iifname @open_lan"], position[name])
             self.assertLess(position[name], position["@open_internet"])
-        self.assertEqual(rules[-1], "counter drop")
+        self.assertEqual(rules[-1], "counter reject with icmpx type admin-prohibited")
 
     def test_host_is_blocked_except_neighbour_discovery_and_egress_proxy(self):
         text = fw.rules("research")
         bridge = fw.identity("research")["bridge"]
         chains = fw.chain_rules(text)
-        self.assertEqual(chains["host_input_guard"][-1], f'iifname "{bridge}" counter drop')
+        self.assertEqual(chains["host_input_guard"][-1], f'iifname "{bridge}" counter reject with icmpx type admin-prohibited')
         self.assertEqual(chains["host_output_guard"][-1], f'oifname "{bridge}" counter drop')
-        self.assertEqual(len(chains["host_input_guard"]), 3)
-        self.assertIn("ct state established", chains["host_output_guard"][2])
+        self.assertEqual(len(chains["host_input_guard"]), 4)
+        self.assertIn("ct state established", chains["host_output_guard"][3])
+
+    def test_blocked_connections_are_refused_at_once(self):
+        chains = fw.chain_rules(fw.rules("research"))
+        # TCP gets a reset (no ICMP rate limit), everything else ICMP; never a silent drop outwards
+        self.assertEqual(chains["outbound"][-2:], ["meta l4proto tcp counter reject with tcp reset",
+                                                   "counter reject with icmpx type admin-prohibited"])
+        self.assertFalse(any(rule.endswith("drop") for rule in chains["outbound"] + chains["host_input_guard"]))
+        bridge = fw.identity("research")["bridge"]
+        self.assertIn(f'oifname "{bridge}" tcp flags rst counter return', chains["host_output_guard"])
+        # traffic from outside to the sandbox stays a silent drop
+        self.assertEqual(chains["forward_guard"][-1], f'oifname "{bridge}" counter drop')
+
+    def test_layout_fingerprint_follows_the_rules(self):
+        self.assertIn(f"layout {fw.layout(fw.identity('research')['bridge'])}", fw.rules("research"))
+        self.assertNotEqual(fw.layout("hfwa"), fw.layout("hfwb"))
 
     def test_boot_rules_never_contain_leases(self):
         text = fw.rules("research", {"lan_v4": ["192.168.0.0/24"]})
@@ -347,11 +364,15 @@ class RuleTests(unittest.TestCase):
         return json.dumps({"nftables": rows})
 
     def test_health_checks_hooks_and_rule_counts(self):
+        text = fw.rules("research").split("delete table", 1)[1]  # what "nft list table" prints (roughly)
         good = self.kernel(fw.rules("research"))
-        with patch.object(fw, "run", side_effect=[result(), result(good)]):
+        with patch.object(fw, "run", side_effect=[result(), result(good), result(text)]):
             fw.health("research")
-        for broken in (json.dumps({"nftables": []}), good.replace('"prio": -10', '"prio": 0', 1)):
-            with self.subTest(broken=broken[:40]), patch.object(fw, "run", side_effect=[result(), result(broken)]):
+        older = text.replace(f"layout {fw.layout(fw.identity('research')['bridge'])}", "layout 000000000000")
+        for json_text, listing in ((json.dumps({"nftables": []}), text), (good.replace('"prio": -10', '"prio": 0', 1), text),
+                                   (good, older), (good, text.replace("comment", "#"))):
+            with self.subTest(listing=listing[:20], json=json_text[:30]), \
+                 patch.object(fw, "run", side_effect=[result(), result(json_text), result(listing)]):
                 with self.assertRaises(fw.FirewallError):
                     fw.health("research")
 

@@ -490,21 +490,15 @@ def elements(items):
     return f"elements = {{ {', '.join(items)} }}" if items else ""
 
 
-def rules(profile, sets=None):
-    sets = sets or {}
-    item = identity(profile)
-    table, bridge = item["table"], item["bridge"]
-    declarations = "".join(f"    set {name} {{\n        type {kind};{flags}\n        {elements(sets.get(name, ()))}\n    }}\n"
-                           for name, kind, flags in SETS)
-    return drop_table(table) + f'''table inet {table} {{
-    comment "hermes-firewall {VERSION}"
-    set open_internet {{ type ifname; flags timeout; timeout 1h; size 1; }}
-    set open_lan {{ type ifname; flags timeout; timeout 1h; size 1; }}
-    set non_public_v4 {{
-        type ipv4_addr; flags interval;
-        {elements(NONPUBLIC_V4)}
-    }}
-{declarations}    chain outbound {{
+# Blocked connections from a sandbox fail at once instead of timing out: TCP gets a reset ("Connection
+# refused"; not subject to the kernel's ICMP rate limit, so many parallel connects all fail fast),
+# everything else ICMP "administratively prohibited". host_output_guard lets exactly these errors from
+# the host reach the sandbox. Traffic from outside to a sandbox is still dropped silently.
+
+
+def chains(bridge):
+    """The four chains of a profile table (the rule layout without set contents)."""
+    return f'''    chain outbound {{
         ip daddr @dns_v4 meta l4proto {{ tcp, udp }} th dport 53 counter return
         ip6 daddr @dns_v6 meta l4proto {{ tcp, udp }} th dport 53 counter return
         ip daddr @allow_v4 counter return
@@ -513,12 +507,17 @@ def rules(profile, sets=None):
         ip6 daddr . meta l4proto . th dport @allow_ports_v6 counter return
         ip daddr @lan_v4 iifname @open_lan counter return
         ip6 daddr @lan_v6 iifname @open_lan counter return
-        ip daddr @lan_v4 counter drop
-        ip6 daddr @lan_v6 counter drop
-        ip daddr @non_public_v4 counter drop
-        ip6 daddr @non_public_v6 counter drop
+        ip daddr @lan_v4 meta l4proto tcp counter reject with tcp reset
+        ip daddr @lan_v4 counter reject with icmpx type admin-prohibited
+        ip6 daddr @lan_v6 meta l4proto tcp counter reject with tcp reset
+        ip6 daddr @lan_v6 counter reject with icmpx type admin-prohibited
+        ip daddr @non_public_v4 meta l4proto tcp counter reject with tcp reset
+        ip daddr @non_public_v4 counter reject with icmpx type admin-prohibited
+        ip6 daddr @non_public_v6 meta l4proto tcp counter reject with tcp reset
+        ip6 daddr @non_public_v6 counter reject with icmpx type admin-prohibited
         iifname @open_internet counter return
-        counter drop
+        meta l4proto tcp counter reject with tcp reset
+        counter reject with icmpx type admin-prohibited
     }}
     chain forward_guard {{
         type filter hook forward priority -10; policy accept;
@@ -538,16 +537,40 @@ def rules(profile, sets=None):
         type filter hook input priority -10; policy accept;
         iifname "{bridge}" icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert }} counter return
         iifname "{bridge}" ip daddr . meta l4proto . th dport @host_ports_v4 counter return
-        iifname "{bridge}" counter drop
+        iifname "{bridge}" meta l4proto tcp counter reject with tcp reset
+        iifname "{bridge}" counter reject with icmpx type admin-prohibited
     }}
     chain host_output_guard {{
         type filter hook output priority -10; policy accept;
         oifname "{bridge}" icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, packet-too-big, destination-unreachable, time-exceeded }} counter return
         oifname "{bridge}" icmp type {{ destination-unreachable, time-exceeded }} counter return
+        oifname "{bridge}" tcp flags rst counter return
         oifname "{bridge}" ip saddr . meta l4proto . th sport @host_ports_v4 ct state established counter return
         oifname "{bridge}" counter drop
     }}
-}}
+'''
+
+
+def layout(bridge):
+    """Fingerprint of the rule layout: health() reloads tables whose rules differ, not only in number."""
+    return hashlib.sha256(chains(bridge).encode()).hexdigest()[:12]
+
+
+def rules(profile, sets=None):
+    sets = sets or {}
+    item = identity(profile)
+    table, bridge = item["table"], item["bridge"]
+    declarations = "".join(f"    set {name} {{\n        type {kind};{flags}\n        {elements(sets.get(name, ()))}\n    }}\n"
+                           for name, kind, flags in SETS)
+    return drop_table(table) + f'''table inet {table} {{
+    comment "hermes-firewall {VERSION} layout {layout(bridge)}"
+    set open_internet {{ type ifname; flags timeout; timeout 1h; size 1; }}
+    set open_lan {{ type ifname; flags timeout; timeout 1h; size 1; }}
+    set non_public_v4 {{
+        type ipv4_addr; flags interval;
+        {elements(NONPUBLIC_V4)}
+    }}
+{declarations}{chains(bridge)}}}
 '''
 
 
@@ -748,6 +771,10 @@ def health(profile):
             counts[chain] = counts.get(chain, 0) + 1
     expected = {chain: len(lines) for chain, lines in chain_rules(rules(profile)).items()}
     require(counts == expected, "Firewall rule structure differs; refusing to claim protection.")
+    # From the text output: nft < 1.1 leaves table comments out of its JSON.
+    comment = re.search(r'^\s*comment "([^"]*)"', run("nft", "list", "table", "inet", item["table"]).stdout, re.M)
+    require(comment and comment[1].endswith(f"layout {layout(item['bridge'])}"),
+            "Firewall rules are from another version; sudo hermes-firewall restore loads the current ones.")
 
 
 def set_elements(profile, name):

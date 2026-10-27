@@ -60,7 +60,9 @@ class AgentNoticeTests(unittest.TestCase):
                                       ("pip install requests", "Failed to establish a new connection", 1),
                                       ("git clone https://github.com/x/y", "fatal: unable to access 'https://github.com/x/y/': "
                                                                           "Failed to connect to github.com port 443", 128),
-                                      ("npm install", "npm ERR! code ETIMEDOUT", 1)):
+                                      ("npm install", "npm ERR! code ETIMEDOUT", 1),
+                                      ("curl https://example.com", "curl: (7) Failed to connect: Connection refused", 7),
+                                      ("pip download x", "Connection reset by peer", 1)):
             with self.subTest(command=command):
                 answer, run = self.call(hook, command=command, output=output, returncode=code)
                 self.assertTrue(answer.startswith(output))
@@ -73,7 +75,9 @@ class AgentNoticeTests(unittest.TestCase):
         hook = self.hook({"agent_notice": True})
         for kwargs in ({"returncode": 0}, {"returncode": None}, {"env_type": "local"},
                        {"command": "ls /nope", "output": "No such file or directory", "returncode": 2},
-                       {"command": "python3 x.py", "output": "SyntaxError", "returncode": 1}):
+                       {"command": "python3 x.py", "output": "SyntaxError", "returncode": 1},
+                       {"command": "curl http://localhost:8000", "output": "Connection refused", "returncode": 7},
+                       {"command": "python3 -m app", "output": "connect to 127.0.0.1:5432: Connection refused", "returncode": 1}):
             with self.subTest(kwargs=kwargs):
                 answer, run = self.call(hook, **kwargs)
                 self.assertIsNone(answer)

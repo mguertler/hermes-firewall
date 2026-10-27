@@ -26,6 +26,7 @@ NETWORK_ERROR = re.compile(
     r"Network is unreachable|No route to host|Connection timed out|Operation timed out|"
     r"Failed to establish a new connection|ConnectTimeout|Max retries exceeded|"
     r"ETIMEDOUT|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|Could not connect to|Unable to connect to|"
+    r"Connection refused|ECONNREFUSED|Connection reset by peer|ECONNRESET|"
     r"unable to access '[^']*': Failed to connect", re.I)
 CURL_NETWORK_EXIT = {6, 7, 28, 35, 56}  # resolve, connect, timeout, TLS connect, receive
 
@@ -69,9 +70,14 @@ def handle(raw_args=""):
     return output.removeprefix("ERROR: ") or "hermes-firewall gave no answer."
 
 
+LOCAL = re.compile(r"localhost|127\.0\.0\.1|\[?::1\]?(?![0-9a-f:])|0\.0\.0\.0", re.I)
+
+
 def network_failure(command, output, returncode):
     if returncode in (None, 0):
         return False
+    if LOCAL.search(command or "") or LOCAL.search(output or ""):
+        return False  # a local service inside the sandbox, not the firewall
     if returncode in CURL_NETWORK_EXIT and re.search(r"\bcurl\b", command or ""):
         return True
     return bool(NETWORK_ERROR.search(output or ""))

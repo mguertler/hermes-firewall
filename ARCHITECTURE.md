@@ -36,9 +36,11 @@ Created by `rules(profile, sets)`; it starts with `drop_table` (`table` + `delet
 4. `non_public_v4/v6`: drop (private and special ranges, 6to4, Teredo, NAT64-embedded non-public IPv4).
 5. Internet lease: accept; final drop.
 
+Every "drop" towards the outside (steps 3 to 5 and the host guard) is a reject, so programs in the sandbox fail at once instead of waiting for a timeout: TCP gets a reset (not subject to the kernel's per-destination ICMP rate limit, which would turn many parallel connects into timeouts again), everything else ICMP admin-prohibited. Packets from outside to the sandbox are still dropped silently.
+
 `forward_guard` (hook forward, priority -10, before Docker's own rules) jumps to `outbound` for traffic from the bridge; return traffic is only accepted for established/related flows that the outbound rules allow. `host_input_guard` / `host_output_guard` block the host itself in both directions, except IPv6 neighbour discovery (needed for IPv6 forwarding), ICMP errors from the host and the Hermes egress proxy ports (`host_ports_v4`, replies only for established connections).
 
-`health()` checks hooks, priorities and that the kernel has exactly as many rules per chain as `rules()` generates (`chain_rules`). Any change of the rule layout therefore makes `upgrade` reload all tables, which closes all leases.
+`health()` checks hooks, priorities, that the kernel has exactly as many rules per chain as `rules()` generates (`chain_rules`) and the layout fingerprint in the table comment (`layout()`, a hash of the chains; read from `nft list table` text, because nft < 1.1 omits table comments from JSON). Any change of the rules therefore makes `upgrade` reload all tables, which closes all leases.
 
 Leases: `lease_transaction(profile, kinds, seconds)` flushes the lease sets and adds the bridge with `timeout Ns` in one nft transaction.
 

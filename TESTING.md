@@ -10,7 +10,7 @@ shellcheck install.sh uninstall.sh tests/*.sh
 
 The unit tests include a fuzz test of the sudo surface: 3,000 random argument sequences behind `open P` and `close P` (fixed seed) must each be a valid lease request or fail without changing anything.
 
-`tests/netns.sh` runs in a private user + network namespace: the namespace plays the Hermes host (router + firewall, docker0 with an egress proxy), with a sandbox, a LAN and an Internet namespace, IPv4 and IPv6. It loads the generated rules with nft and checks 24 targets in the states closed / lan / internet / all / closed again: LAN hosts, the public address of a LAN host, Internet, DNS (IPv4 and IPv6), `[[allow]]` address and network, other private networks, the host itself, the egress proxy, IPv6 ULA and global LAN prefixes, NAT64 (public, LAN and private embedded addresses) and 6to4. It must pass after every rule change. A quick mutation check (e.g. let `nat64()` return `[]`) shows that it catches bypasses.
+`tests/netns.sh` runs in a private user + network namespace: the namespace plays the Hermes host (router + firewall, docker0 with an egress proxy), with a sandbox, a LAN and an Internet namespace, IPv4 and IPv6. It loads the generated rules with nft and checks 24 targets in the states closed / lan / internet / all / closed again: LAN hosts, the public address of a LAN host, Internet, DNS (IPv4 and IPv6), `[[allow]]` address and network, other private networks, the host itself, the egress proxy, IPv6 ULA and global LAN prefixes, NAT64 (public, LAN and private embedded addresses) and 6to4. Blocked targets must be refused at once: a timeout counts as a failure. It must pass after every rule change. A quick mutation check (e.g. let `nat64()` return `[]`) shows that it catches bypasses.
 
 The CI workflow (`.github/workflows/ci.yml`) runs all three on Ubuntu.
 
@@ -79,4 +79,6 @@ Not covered automatically; record the result (distribution, versions, date) belo
 | 2026-10-27 | manual 6 (iron-proxy 0.39.0: add explains enforce_on_docker; tunnel and HTTP port reachable while closed, management port and other host ports blocked; same proxy answers with and without firewall) | test VM | pass |
 | 2026-10-27 | manual 7 (uninstall refused with profiles; keeps config.toml; reinstall uses it; --purge leaves nothing; Docker keeps running) | test VM | pass |
 | 2026-10-27 | agent notice: off = untouched output; on = one line on curl timeout with closed firewall, model (ministral-3:8b) then asks for `/firewall open`; needs a fresh gateway after plugin updates | test VM | pass |
+| 2026-10-27 | reject instead of drop: netns.sh (all blocked targets refused at once) with nft 1.1.3 and nft 1.0.6 (Debian 12); real `health()` against loaded tables with both versions | local, rootless | pass |
+| | live: reject on the test VM (integration.sh expects refusals and a reset on expiry) | | **not done yet** |
 | | a full provider request through iron-proxy (needs a real API key); manual 8 live on other distributions (containers: pass) | | **not done** |
