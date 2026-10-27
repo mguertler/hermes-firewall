@@ -8,6 +8,8 @@ bash tests/netns.sh                          # packet test of the real rules, ne
 shellcheck install.sh uninstall.sh tests/*.sh
 ```
 
+The unit tests include a fuzz test of the sudo surface: 3,000 random argument sequences behind `open P` and `close P` (fixed seed) must each be a valid lease request or fail without changing anything.
+
 `tests/netns.sh` runs in a private user + network namespace: the namespace plays the Hermes host (router + firewall, docker0 with an egress proxy), with a sandbox, a LAN and an Internet namespace, IPv4 and IPv6. It loads the generated rules with nft and checks 24 targets in the states closed / lan / internet / all / closed again: LAN hosts, the public address of a LAN host, Internet, DNS (IPv4 and IPv6), `[[allow]]` address and network, other private networks, the host itself, the egress proxy, IPv6 ULA and global LAN prefixes, NAT64 (public, LAN and private embedded addresses) and 6to4. It must pass after every rule change. A quick mutation check (e.g. let `nat64()` return `[]`) shows that it catches bypasses.
 
 The CI workflow (`.github/workflows/ci.yml`) runs all three on Ubuntu.

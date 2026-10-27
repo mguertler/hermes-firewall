@@ -23,6 +23,7 @@ These must stay true. Change them only deliberately, together with tests and doc
 - Sandboxes are moved (restricting only) without asking; a sandbox is removed (reset) only after confirmation on a terminal or `add --yes`, and only containers carrying the profile's Hermes labels.
 - Files are removed only when known to be ours: plugin files by name, no recursive deletion; `uninstall` refuses unknown files and remaining networks/tables.
 - The model never gets a way to open the firewall: `/firewall` is a slash command (user only), no tool. The optional agent notice (`agent_notice`, off by default) only adds one line to the output of a sandbox command that failed with a network error while a lease is closed; never to the prompt or to other output.
+- The program sudo runs without a password, and every directory above it, is owned by root and writable only by root (group root at most): `install` and `upgrade` refuse otherwise, `status` reports it as an error.
 - sudoers allows exactly `open`, `close` and `status` of protected profiles. Those verbs accept no options. `visudo -cf` validates every sudoers file before it is installed.
 
 ## Usability

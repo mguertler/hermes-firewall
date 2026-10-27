@@ -737,6 +737,7 @@ class InstallTests(unittest.TestCase):
             stack.enter_context(patch.object(fw, "trusted"))
             stack.enter_context(patch.object(fw, "docker_ready"))
             stack.enter_context(patch.object(fw, "flush_warnings", return_value=[]))
+            stack.enter_context(patch.object(fw, "replaceable_by_others", return_value=[]))
             stack.enter_context(patch("builtins.print"))
             yield stack.enter_context(patch.object(fw, "run", return_value=result()))
 
@@ -800,6 +801,107 @@ class InstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, self.installed_paths(Path(directory)):
             with self.assertRaisesRegex(fw.FirewallError, "not .*installed"):
                 fw.upgrade(Path(directory))
+
+
+def fake_stat(owners):
+    """os.stat/lstat replacement: {path: (uid, gid, mode)}; unknown paths are root 0755 directories."""
+    def stat_of(path):
+        uid, gid, mode = owners.get(str(path), (0, 0, 0o40755))
+        return os.stat_result((mode, 0, 0, 1, uid, gid, 0, 0, 0, 0))
+    return stat_of
+
+
+class ProgramPathTests(unittest.TestCase):
+    def check(self, owners):
+        stat_of = fake_stat(owners)
+        with patch.object(fw.os, "stat", side_effect=stat_of), patch.object(fw.os, "lstat", side_effect=stat_of):
+            return fw.replaceable_by_others(Path("/usr/local/bin/hermes-firewall"))
+
+    def test_root_owned_path_is_safe(self):
+        self.assertEqual(self.check({"/usr/local/bin/hermes-firewall": (0, 0, 0o100755)}), [])
+        # group root may write (some distributions); another group may not (old Debian: staff)
+        self.assertEqual(self.check({"/usr/local": (0, 0, 0o42775)}), [])
+        self.assertEqual(self.check({"/usr/local": (0, 50, 0o42775)}), ["/usr/local"])
+
+    def test_anything_others_can_change_is_reported(self):
+        for owners, bad in (({"/usr/local/bin/hermes-firewall": (1000, 1000, 0o100755)}, "/usr/local/bin/hermes-firewall"),
+                            ({"/usr/local/bin/hermes-firewall": (0, 0, 0o100757)}, "/usr/local/bin/hermes-firewall"),
+                            ({"/usr/local/bin/hermes-firewall": (0, 0, 0o120777)}, "/usr/local/bin/hermes-firewall"),
+                            ({"/usr/local/bin": (0, 0, 0o40777)}, "/usr/local/bin"),
+                            ({"/usr": (1000, 0, 0o40755)}, "/usr")):
+            with self.subTest(bad=bad, owners=owners):
+                self.assertEqual(self.check(owners), [bad])
+
+    def test_install_and_status_refuse_a_replaceable_program(self):
+        with patch.object(fw, "replaceable_by_others", return_value=["/usr/local/bin"]):
+            with self.assertRaisesRegex(fw.FirewallError, "could be replaced"):
+                fw.require_safe_program()
+            with patch.object(fw, "health"), patch.object(fw, "networks", return_value={"hermes-fw-research"}), \
+                 patch.object(fw, "check_network"), patch.object(fw, "load_config", return_value=CONF), \
+                 patch.object(fw, "protect_sandboxes", return_value=[]), \
+                 patch.object(fw, "lease_remaining", return_value=None), patch("builtins.print") as output:
+                with self.assertRaisesRegex(fw.FirewallError, "program"):
+                    fw.status(registry("research"))
+        self.assertIn("can be changed by non-root users", output.call_args.args[0])
+
+
+class SudoArgumentFuzzTests(unittest.TestCase):
+    """sudoers allows 'open P *' and 'close P *': whatever follows must either be a valid lease
+    request or fail before anything changes."""
+    TOKENS = ["internet", "lan", "all", "for", "30s", "10m", "2h", "24h", "25h", "0s", "1d", "01h", "-1h",
+              "--yes", "--bundle=/tmp/x", "-v", "--", "-", "upgrade", "install", "remove", "add", "status",
+              "research", "work", "../x", "/etc/passwd", "lan;id", "$(id)", "`id`", "lan\nall", "1h ", "",
+              "ALL", "Internet", "ä", "x" * 300, "for", "for"]
+
+    def valid(self, verb, words):
+        kinds = [w for w in words if w in ("internet", "lan", "all")]
+        durations = [w for w in words if w in ("30s", "10m", "2h", "24h")]
+        rest = [w for w in words if w != "for" and w not in kinds and w not in durations]
+        if verb == "close":
+            return not rest and not durations and "for" not in words and len(kinds) <= 1
+        return not rest and len(kinds) <= 1 and len(durations) <= 1
+
+    def run_main(self, argv):
+        applied = []
+        lock = os.stat_result((0o100600, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(fw, "LOCK", Path(directory) / "lock"), patch.object(fw.os, "geteuid", return_value=0), \
+             patch.object(fw.os, "fstat", return_value=lock), patch.object(fw, "load_registry", return_value=registry("research")), \
+             patch.object(fw, "load_config", return_value=CONF), patch.object(fw, "health"), patch.object(fw, "docker_ready"), \
+             patch.object(fw, "check_network"), patch.object(fw, "profile_line", return_value=""), \
+             patch.object(fw, "nft_apply", side_effect=applied.append), patch.object(fw, "run") as run, \
+             patch("builtins.print"):
+            try:
+                fw.main(argv)
+                error = None
+            except fw.FirewallError as caught:
+                error = caught
+        return error, applied, run
+
+    def test_random_arguments_behind_open_and_close(self):
+        import random
+        rng = random.Random(4711)  # fixed seed: the same cases on every run
+        cases = [[]] + [[rng.choice(self.TOKENS) for _ in range(rng.randint(1, 4))] for _ in range(1500)]
+        for verb in ("open", "close"):
+            for words in cases:
+                with self.subTest(verb=verb, words=words):
+                    error, applied, run = self.run_main([verb, "research", *words])
+                    run.assert_not_called()  # never another command
+                    if self.valid(verb, words):
+                        self.assertIsNone(error)
+                        self.assertEqual(len(applied), 1)
+                        self.assertNotIn("delete table", applied[0])
+                        self.assertNotIn("work", applied[0])
+                    else:
+                        self.assertIsNotNone(error)
+                        self.assertEqual(applied, [])
+
+    def test_other_profiles_are_never_touched(self):
+        for argv in (["open", "work"], ["close", "work", "lan"], ["open", "research/../work"], ["open", "Research"]):
+            with self.subTest(argv=argv):
+                error, applied, _ = self.run_main(argv)
+                self.assertIsNotNone(error)
+                self.assertEqual(applied, [])
 
 
 if __name__ == "__main__":

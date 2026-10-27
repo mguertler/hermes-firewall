@@ -58,6 +58,8 @@ Index of `hermes_firewall.py` (in file order) and the plugin. Keep it in sync wh
 | Function | Job |
 |---|---|
 | `trusted(path)` | Refuse symlinks and files not owned by root or writable by others. |
+| `replaceable_by_others(path)` | Path and parents a non-root user could change (owner, write bits, symlink). |
+| `require_safe_program()` | Refuse when the password-less sudo program could be replaced. |
 | `validate_registry(data)` / `load_registry()` / `save_registry(data)` | Registry `profiles.json`. |
 | `atomic_write(path, data, mode)` | Write via temporary file, fsync, rename. |
 | `run(*arguments, input, check, session)` | Run a system command with a fixed environment and no stdin; raise on failure. |

@@ -613,6 +613,28 @@ def trusted(path):
             f"Not root-owned / writable by others / symlink: {path}")
 
 
+def replaceable_by_others(path):
+    """Path and every directory above it that a non-root user could change: not owned by root,
+    or writable by others (group-writable only for group root). sudo runs EXE without a password,
+    so nobody but root may be able to replace it."""
+    found = []
+    for item in [Path(path), *Path(path).parents]:
+        try:
+            info = os.lstat(item) if item == Path(path) else os.stat(item)
+        except FileNotFoundError:
+            continue  # not installed yet: the directories above still count
+        group_writable = info.st_mode & 0o020 and info.st_gid != 0
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o002 or group_writable:
+            found.append(str(item))
+    return found
+
+
+def require_safe_program():
+    unsafe = replaceable_by_others(EXE)
+    require(not unsafe, f"{', '.join(unsafe)}: not owned by root or writable by others, so the program that "
+                        f"sudo runs without a password could be replaced. Fix: chown root and chmod go-w.")
+
+
 def validate_registry(data):
     require(type(data) is dict and data.get("version") == 2 and type(data.get("profiles")) is dict,
             f"Invalid {REGISTRY}; no automatic repair was attempted.")
@@ -1247,6 +1269,11 @@ def status(data, user=None, selected=None, verbose=False):
                       f"{', '.join((container.get('NetworkSettings') or {}).get('Networks') or {}) or 'none'}")
     if conf and not selected:
         print(f"Always reachable from protected sandboxes: {always_text(conf)}")
+    unsafe = replaceable_by_others(EXE) if data["profiles"] else []
+    if unsafe:
+        problems.append("program")
+        print(f"ERROR - {', '.join(unsafe)} can be changed by non-root users; /firewall runs this program "
+              "as root. Fix: chown root and chmod go-w.")
     require(not problems, f"Firewall problem for: {', '.join(problems)}.")
 
 
@@ -1348,6 +1375,7 @@ def install(bundle):
         atomic_write(CONFIG, config_text((bundle / "config.example.toml").read_text(encoding="utf-8"), dns))
     conf = load_config()
     atomic_write(REGISTRY, '{"profiles": {}, "version": 2}\n')
+    require_safe_program()
     write_program(bundle)
     write_units(conf)
     run("systemctl", "daemon-reload")
@@ -1369,6 +1397,7 @@ def upgrade(bundle):
             trusted(path)
     data = load_registry()
     conf = load_config()  # an invalid configuration stops the upgrade before anything changes
+    require_safe_program()
     write_program(bundle)
     if write_units(conf):
         run("systemctl", "daemon-reload")
