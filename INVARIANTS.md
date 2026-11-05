@@ -38,7 +38,7 @@ These must stay true. Change them only deliberately, together with tests and doc
 - A message says what is going on and what to do, in at most two lines.
 - `open PROFILE` alone means Internet for `lease.default` (1h); kind and duration may come in any order, `for` is optional; `close PROFILE` closes everything.
 - The installer writes `config.toml` once; upgrades never overwrite it. Only `mcp add` changes it, by adding the `[[mcp]]` table the user just answered for; everything else in the file stays, and a file that would not load is never written.
-- `status` keeps sandbox firewalls and MCP container firewalls in two separate parts.
+- `status` and the usage keep sandbox firewalls and MCP container firewalls in two separate parts. While nothing protects anything, they say so: `SANDBOX FIREWALL INACTIVE`, `MCP FIREWALL INACTIVE`.
 
 ## Code
 

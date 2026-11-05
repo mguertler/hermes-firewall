@@ -79,6 +79,7 @@ Hermes reuses long-lived containers (`container_persistent: true`); its reuse ch
 
 ## Commands
 
+- No arguments or `--help`: `usage_text`, without root, as the registry is readable by everyone: description, what is inactive, the commands in a sandbox and an MCP part. `status` warns the same way, for MCP only if no profile is protected or a protected profile has Docker MCP servers without a firewall, because a profile without any needs none; the usage cannot check that without calling Hermes.
 - `add PROFILE`: checks (as the user), creates table (persist registry, load rules closed) and only then the Docker network, attaches the profile, writes sudoers, protects existing sandboxes. Running it again repairs network, profile and sandboxes.
 - `mcp scan|add|remove`: see [MCP firewalls](#mcp-firewalls). `remove PROFILE` refuses while the profile has MCP firewalls.
 - `remove PROFILE`: detaches the profile, disconnects containers from the network, removes the network, then the table, registry entry and sudoers line.

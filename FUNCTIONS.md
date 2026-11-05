@@ -179,6 +179,7 @@ Index of `hermes_firewall.py` (in file order) and the plugin. Keep it in sync wh
 | `write_program(bundle)` | Program and plugin source. |
 | `write_units(conf)` | Units and Docker drop-in as configured. |
 | `install(bundle)` / `upgrade(bundle)` / `uninstall(data, purge)` | Package lifecycle. |
+| `usage_text()` | Description, what is inactive and the commands; for no arguments and `--help`, without root. |
 | `parse(argv)` | Words and options; options only where allowed. |
 | `main(argv)` | Dispatch under the global lock. |
 

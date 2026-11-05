@@ -66,6 +66,8 @@ hermes -p default config set plugins.entries.hermes-firewall.settings.agent_noti
 
 ## Usage
 
+`hermes-firewall` without arguments shows this overview, and warns while no profile or no MCP server has been added: `SANDBOX FIREWALL INACTIVE`, `MCP FIREWALL INACTIVE`. `status` has to be called by name.
+
 ```text
 sudo hermes-firewall add PROFILE                    protect a profile (everything closed)
 sudo hermes-firewall open PROFILE [for] [internet|lan|all] [DURATION]

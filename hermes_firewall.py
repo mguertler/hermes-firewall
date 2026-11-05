@@ -1957,6 +1957,8 @@ def status(data, user=None, selected=None, verbose=False, proof=False):
     indent = "  " if parts else ""
     if parts:
         print("Sandbox firewall (the Docker sandbox of each Hermes profile; open and close change it):")
+        if not data["profiles"]:
+            print(f"  {NO_PROFILE_WARNING}")
     if not profiles:
         print(f"{indent}No Hermes profiles found.")
     for profile in profiles:
@@ -2034,9 +2036,12 @@ def status(data, user=None, selected=None, verbose=False, proof=False):
             item = identity(key)
             print(f"    network {item['network']} ({record['subnet']}), bridge {item['bridge']}, table inet {item['table']}")
             print(f"    allowed now: {', '.join(set_elements(key, 'allow_ports_v4') + set_elements(key, 'allow_ports_v6')) or 'nothing'}")
+    # Only where it matters: a protected profile without any Docker MCP server needs no MCP firewall.
+    if parts and not keys and (warnings or not data["profiles"]):
+        print(f"  {NO_MCP_WARNING}")
     for message in warnings:
         print(f"  {message}")
-    if parts and not keys and not warnings:
+    if parts and not keys and not warnings and data["profiles"]:
         print("  none (MCP servers of a profile: sudo hermes-firewall mcp scan PROFILE)")
     unsafe = replaceable_by_others(EXE) if targets(data) else []
     if unsafe:
@@ -2243,15 +2248,22 @@ def uninstall(data, purge=False):
           + ("" if purge else f" Settings kept in {CONFIG} (remove with: uninstall --purge)."))
 
 
-USAGE = """usage:
+DESCRIPTION = "hermes-firewall secures Hermes sandbox containers and optionally MCP containers."
+NO_PROFILE_WARNING = "WARNING: no Hermes profile added yet: SANDBOX FIREWALL INACTIVE"
+NO_MCP_WARNING = "WARNING: no MCP server for a profile added yet: MCP FIREWALL INACTIVE"
+USAGE = """Sandbox firewall (one per Hermes profile, closed until you open it):
   hermes-firewall add PROFILE                     protect a Hermes profile (everything closed)
   hermes-firewall open PROFILE [for] [internet|lan|all] [DURATION]
   hermes-firewall close PROFILE [internet|lan|all]
-  hermes-firewall status [PROFILE] [--verbose] [--proof]   --proof tests each firewall with real packets
   hermes-firewall remove PROFILE                  remove the firewall; the sandbox then has no network
+
+MCP container firewall (one per MCP server in Docker, only its allow list, never opens):
   hermes-firewall mcp scan PROFILE                what the profile's MCP servers can reach
   hermes-firewall mcp add PROFILE SERVER          lock a Docker MCP server to an allow list (asks for it if there is none)
   hermes-firewall mcp remove PROFILE SERVER       remove its firewall; the server then has no network
+
+Both:
+  hermes-firewall status [PROFILE] [--verbose] [--proof]   --proof tests each firewall with real packets
   hermes-firewall refresh | restore | uninstall [--purge]
 
 examples (as the user running Hermes):
@@ -2260,7 +2272,8 @@ examples (as the user running Hermes):
   sudo hermes-firewall open default for lan 30m   LAN for 30 minutes, no Internet
   sudo hermes-firewall open default all 2h        Internet and LAN for 2 hours
   sudo hermes-firewall close default              close everything
-  sudo hermes-firewall status                     all profiles: protected? open? time left
+  sudo hermes-firewall mcp add default github     lock the MCP server github of the default profile
+  sudo hermes-firewall status                     all firewalls: protected? open? time left
 
 In a Hermes chat of a protected profile: /firewall open, /firewall open lan 30m,
 /firewall close, /firewall status
@@ -2268,6 +2281,19 @@ In a Hermes chat of a protected profile: /firewall open, /firewall open lan 30m,
 DURATION: 30s, 10m, 2h, ... (default and maximum: /etc/hermes-firewall/config.toml).
 Reopening restarts the time. A reboot closes everything. The host itself, other
 private networks and everything not opened stay blocked."""
+
+
+def usage_text():
+    """What the program prints without arguments; needs no root: the registry is readable by everyone."""
+    try:
+        data = load_registry()
+    except FileNotFoundError:
+        warnings = ["WARNING: hermes-firewall is not installed: FIREWALL INACTIVE"]
+    except (OSError, ValueError, FirewallError) as error:
+        warnings = [f"WARNING: cannot read {REGISTRY}: {error}"]
+    else:
+        warnings = [*([] if data["profiles"] else [NO_PROFILE_WARNING]), *([] if data.get("mcp") else [NO_MCP_WARNING])]
+    return "\n\n".join([DESCRIPTION, *(["\n".join(warnings)] if warnings else []), USAGE])
 
 
 def parse(argv):
@@ -2285,8 +2311,8 @@ def parse(argv):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] in ("-h", "--help", "help"):
-        print(USAGE)
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(usage_text())
         return
     if argv == ["--version"]:
         print(VERSION)

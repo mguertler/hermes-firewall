@@ -1396,6 +1396,55 @@ class ProofTests(unittest.TestCase):
         self.assertNotIn("status research *", fw.sudoers_text(registry("research")))
 
 
+class UsageTests(unittest.TestCase):
+    def usage(self, argv=(), **registry_answer):
+        with patch.object(fw, "load_registry", **registry_answer), patch.object(fw.os, "geteuid", return_value=1000), \
+             patch("builtins.print") as output:
+            fw.main(list(argv))
+        return output.call_args.args[0]
+
+    def test_no_arguments_show_the_usage_without_root(self):
+        text = self.usage(return_value=registry("research"))
+        self.assertTrue(text.startswith("hermes-firewall secures Hermes sandbox containers and optionally MCP containers.\n\n"))
+        self.assertIn("mcp add PROFILE SERVER", text)
+        self.assertEqual(self.usage(["--help"], return_value=registry("research")), text)
+
+    def test_sandbox_and_mcp_are_separate_parts(self):
+        text = self.usage(return_value=registry("research"))
+        sandbox, mcp, both = text.index("Sandbox firewall ("), text.index("MCP container firewall ("), text.index("Both:")
+        self.assertLess(sandbox, mcp)
+        self.assertLess(mcp, both)
+        self.assertLess(text.index("hermes-firewall open PROFILE"), mcp)
+        self.assertLess(mcp, text.index("hermes-firewall mcp scan"))
+        self.assertLess(text.index("hermes-firewall mcp remove"), both)
+        self.assertLess(both, text.index("hermes-firewall status [PROFILE]"))
+
+    def test_warnings_name_the_firewall_that_is_inactive(self):
+        record = {"user": "hermes", "ipv6": False, "subnet": "172.31.240.0/28", "dns": []}
+        nothing = self.usage(return_value=registry())
+        self.assertIn(fw.NO_PROFILE_WARNING, nothing)
+        self.assertIn(fw.NO_MCP_WARNING, nothing)
+        self.assertLess(nothing.index("WARNING"), nothing.index("Sandbox firewall ("))
+        profile = self.usage(return_value=registry("research"))
+        self.assertNotIn(fw.NO_PROFILE_WARNING, profile)
+        self.assertIn(fw.NO_MCP_WARNING, profile)
+        both = self.usage(return_value={**registry("research"), "mcp": {"research/github": record}})
+        self.assertNotIn("WARNING", both)
+        mcp_only = self.usage(return_value={**registry(), "mcp": {"research/github": record}})
+        self.assertIn(fw.NO_PROFILE_WARNING, mcp_only)
+        self.assertNotIn(fw.NO_MCP_WARNING, mcp_only)
+
+    def test_not_installed_and_unreadable_are_said_plainly(self):
+        self.assertIn("is not installed: FIREWALL INACTIVE", self.usage(side_effect=FileNotFoundError()))
+        unreadable = self.usage(side_effect=PermissionError("denied"))
+        self.assertIn("cannot read", unreadable)
+        self.assertIn("Sandbox firewall (", unreadable)
+
+    def test_commands_still_need_root(self):
+        with patch.object(fw.os, "geteuid", return_value=1000), self.assertRaisesRegex(fw.FirewallError, "sudo"):
+            fw.main(["status"])
+
+
 class StatusPartsTests(unittest.TestCase):
     def setUp(self):
         for name, value in (("replaceable_by_others", []), ("health", None), ("networks", {"hermes-fw-research", "hermes-mcp-research-github"}),
@@ -1406,10 +1455,10 @@ class StatusPartsTests(unittest.TestCase):
             self.addCleanup(item.stop)
         self.data = {**registry("research"), "mcp": {"research/github": {"user": "hermes", "ipv6": False, "subnet": "172.31.240.0/28", "dns": []}}}
 
-    def lines(self, data, selected=None, warnings=()):
+    def lines(self, data, selected=None, warnings=(), user=None):
         with patch.object(fw, "mcp_warnings", return_value=list(warnings)), patch.object(fw.pwd, "getpwnam", return_value=USER), \
              patch("builtins.print") as output:
-            fw.status(data, selected=selected)
+            fw.status(data, user, selected=selected)
         return "\n".join(str(c.args[0]) for c in output.call_args_list).split("\n")
 
     def test_sandboxes_and_mcp_containers_are_two_parts(self):
@@ -1428,6 +1477,22 @@ class StatusPartsTests(unittest.TestCase):
         lines = self.lines(registry("research"))
         self.assertTrue(lines[lines.index("") + 1].startswith("MCP container firewall"))
         self.assertTrue(lines[-1].startswith("  none"))
+        self.assertFalse(any("INACTIVE" in line for line in lines))
+
+    def test_nothing_added_yet_warns_about_both(self):
+        with patch.object(fw, "hermes_profiles", return_value={"research"}):
+            lines = self.lines(registry(), user=USER)
+        blank = lines.index("")
+        self.assertEqual(lines[1], f"  {fw.NO_PROFILE_WARNING}")
+        self.assertIn("  research: NOT protected (to protect it: sudo hermes-firewall add research)", lines[:blank])
+        self.assertEqual(lines[blank + 2], f"  {fw.NO_MCP_WARNING}")
+        self.assertFalse(any(line.startswith("  none") for line in lines))
+
+    def test_docker_mcp_servers_without_a_firewall_warn(self):
+        lines = self.lines(registry("research"), warnings=["research: WARNING - MCP server x runs in Docker WITHOUT a firewall."])
+        at = lines.index(f"  {fw.NO_MCP_WARNING}")
+        self.assertIn("MCP server x", lines[at + 1])
+        self.assertFalse(any(line.startswith("  none") or fw.NO_PROFILE_WARNING in line for line in lines))
 
     def test_status_of_one_profile_stays_one_line_without_mcp_firewalls(self):
         self.assertEqual(self.lines(registry("research"), selected="research"), ["research: firewall active, Internet closed, LAN closed"])
