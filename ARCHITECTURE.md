@@ -37,6 +37,8 @@ Created by `rules(profile, sets)`; it starts with `drop_table` (`table` + `delet
 4. `non_public_v4/v6`: drop (private and special ranges, 6to4, Teredo, NAT64-embedded non-public IPv4).
 5. Internet lease: accept; final drop.
 
+Lookups with ports read `ip protocol` / `ip6 nexthdr`, not `meta l4proto`. nft before 1.1.0 adds a `byteorder` step for `meta l4proto` in a concatenation of an interval set (fixed in nftables by `9fe58952c45a`), and kernels with `netfilter: nft_byteorder: remove multi-register support` (since 6.12.115, 6.18.59 and 7.1) refuse the whole table for that, so old LTS distributions could no longer load it. The price: an IPv6 packet with an extension header does not match an `[[allow]]` entry with a port, unless a lease or an entry without a port lets it through.
+
 Every "drop" towards the outside (steps 3 to 5 and the host guard) is a reject, so programs in the sandbox fail at once instead of waiting for a timeout: TCP gets a reset (not subject to the kernel's per-destination ICMP rate limit, which would turn many parallel connects into timeouts again), everything else ICMP admin-prohibited. Packets from outside to the sandbox are still dropped silently.
 
 `forward_guard` (hook forward, priority -10, before Docker's own rules) jumps to `outbound` for traffic from the bridge; return traffic is only accepted for established/related flows that the outbound rules allow. `host_input_guard` / `host_output_guard` block the host itself in both directions, except IPv6 neighbour discovery (needed for IPv6 forwarding), ICMP errors from the host and the Hermes egress proxy ports (`host_ports_v4`, replies only for established connections).

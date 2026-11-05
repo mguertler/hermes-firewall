@@ -629,6 +629,9 @@ def elements(items):
 # refused"; not subject to the kernel's ICMP rate limit, so many parallel connects all fail fast),
 # everything else ICMP "administratively prohibited". host_output_guard lets exactly these errors from
 # the host reach the sandbox. Traffic from outside to a sandbox is still dropped silently.
+#
+# Lookups with ports use ip protocol / ip6 nexthdr, never meta l4proto: nft before 1.1.0 adds a byteorder
+# step for it in interval sets, and kernels since 6.12.115, 6.18.59 and 7.1 refuse the whole table for that.
 
 
 def chains(bridge):
@@ -638,8 +641,8 @@ def chains(bridge):
         ip6 daddr @dns_v6 meta l4proto {{ tcp, udp }} th dport 53 counter return
         ip daddr @allow_v4 counter return
         ip6 daddr @allow_v6 counter return
-        ip daddr . meta l4proto . th dport @allow_ports_v4 counter return
-        ip6 daddr . meta l4proto . th dport @allow_ports_v6 counter return
+        ip daddr . ip protocol . th dport @allow_ports_v4 counter return
+        ip6 daddr . ip6 nexthdr . th dport @allow_ports_v6 counter return
         ip daddr @lan_v4 iifname @open_lan counter return
         ip6 daddr @lan_v6 iifname @open_lan counter return
         ip daddr @lan_v4 meta l4proto tcp counter reject with tcp reset
@@ -661,8 +664,8 @@ def chains(bridge):
         oifname "{bridge}" ip6 saddr @dns_v6 meta l4proto {{ tcp, udp }} th sport 53 ct state established,related counter return
         oifname "{bridge}" ip saddr @allow_v4 ct state established,related counter return
         oifname "{bridge}" ip6 saddr @allow_v6 ct state established,related counter return
-        oifname "{bridge}" ip saddr . meta l4proto . th sport @allow_ports_v4 ct state established,related counter return
-        oifname "{bridge}" ip6 saddr . meta l4proto . th sport @allow_ports_v6 ct state established,related counter return
+        oifname "{bridge}" ip saddr . ip protocol . th sport @allow_ports_v4 ct state established,related counter return
+        oifname "{bridge}" ip6 saddr . ip6 nexthdr . th sport @allow_ports_v6 ct state established,related counter return
         oifname "{bridge}" oifname @open_internet ct state established,related counter return
         oifname "{bridge}" oifname @open_lan ip saddr @lan_v4 ct state established,related counter return
         oifname "{bridge}" oifname @open_lan ip6 saddr @lan_v6 ct state established,related counter return
@@ -671,7 +674,7 @@ def chains(bridge):
     chain host_input_guard {{
         type filter hook input priority -10; policy accept;
         iifname "{bridge}" icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert }} counter return
-        iifname "{bridge}" ip daddr . meta l4proto . th dport @host_ports_v4 counter return
+        iifname "{bridge}" ip daddr . ip protocol . th dport @host_ports_v4 counter return
         iifname "{bridge}" meta l4proto tcp counter reject with tcp reset
         iifname "{bridge}" counter reject with icmpx type admin-prohibited
     }}
@@ -680,7 +683,7 @@ def chains(bridge):
         oifname "{bridge}" icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, packet-too-big, destination-unreachable, time-exceeded }} counter return
         oifname "{bridge}" icmp type {{ destination-unreachable, time-exceeded }} counter return
         oifname "{bridge}" tcp flags rst counter return
-        oifname "{bridge}" ip saddr . meta l4proto . th sport @host_ports_v4 ct state established counter return
+        oifname "{bridge}" ip saddr . ip protocol . th sport @host_ports_v4 ct state established counter return
         oifname "{bridge}" counter drop
     }}
 '''

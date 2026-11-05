@@ -171,7 +171,7 @@ Limits: it tries a sample of targets, not every address. It tests the network, n
 
 ## Settings
 
-`/etc/hermes-firewall/config.toml` is written once by the installer (with the DNS servers it found) and never overwritten by upgrades. After changing it run `sudo hermes-firewall refresh` (it happens every 5 minutes anyway; open leases stay open). All settings, with comments: [config.example.toml](config.example.toml).
+`/etc/hermes-firewall/config.toml` is written once by the installer (with the DNS servers it found) and never overwritten by upgrades. After changing it run `sudo hermes-firewall refresh` (it happens every 5 minutes anyway; open leases stay open). Only `docker_requires_firewall` needs `sudo ./install.sh`. All settings, with comments: [config.example.toml](config.example.toml).
 
 ```toml
 [lease]

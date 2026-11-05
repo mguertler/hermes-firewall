@@ -355,6 +355,13 @@ class RuleTests(unittest.TestCase):
         self.assertIn("--check", calls[0][0])
         self.assertEqual(calls[1][1]["input"], lan)
 
+    def test_rules_load_with_old_nft_on_new_kernels(self):
+        # nft before 1.1.0 adds a byteorder step for meta l4proto in a concatenation; new kernels refuse the table.
+        self.assertNotIn("meta l4proto .", fw.chains("hfwtest"))
+        self.assertNotRegex(fw.chains("hfwtest"), r"\. meta l4proto")
+        self.assertIn("ip daddr . ip protocol . th dport @allow_ports_v4", fw.chains("hfwtest"))
+        self.assertIn("ip6 daddr . ip6 nexthdr . th dport @allow_ports_v6", fw.chains("hfwtest"))
+
     def test_refresh_replaces_every_set_but_no_lease(self):
         sets = {name: [] for name, _, _ in fw.SETS}
         sets["dns_v4"] = ["192.168.0.5"]

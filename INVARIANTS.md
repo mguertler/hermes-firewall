@@ -15,6 +15,7 @@ These must stay true. Change them only deliberately, together with tests and doc
 - Every change of the rules changes the layout fingerprint, so `upgrade` reloads the tables instead of leaving old rules in place.
 - An MCP firewall never opens: no leases, no `open`/`close`, no sudoers rule. Its container reaches only the targets and ports of its allow list in the root-owned `config.toml`, DNS only if that list has names, and never the host. Removing it leaves the server with no network, never an unfiltered one.
 - `status --proof` only ever tests: it adds no rule, opens no lease, leaves nothing behind, and is not reachable through the sudoers rules.
+- No `meta l4proto` in a concatenated lookup: old nft plus new kernels would refuse the whole table (see ARCHITECTURE.md).
 - `bash tests/netns.sh` must pass after any rule change.
 
 ## Scope of changes
