@@ -1,5 +1,6 @@
 """Tests of the Hermes plugin /firewall; Hermes itself is not needed."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -91,6 +92,87 @@ class AgentNoticeTests(unittest.TestCase):
         self.assertIn("Internet open for 5m (until 14:00), LAN closed", self.call(hook, status=partly)[0])
 
 
+class Hermes(Context):
+    """A Hermes with frozen system prompt sections."""
+    def __init__(self, settings=None):
+        super().__init__(settings)
+        self.sections = {}
+
+    def register_system_prompt_section(self, id, content, **kwargs):
+        self.sections[id] = content
+
+
+class PromptRuleTests(unittest.TestCase):
+    def rendered(self, settings):
+        ctx = Hermes(settings)
+        with patch.object(plugin.subprocess, "run") as run:
+            plugin.register(ctx)
+            text = ctx.sections["hermes-firewall.rule"]({"session_id": "s", "profile_name": "research"})
+        run.assert_not_called()  # the rule holds no state, so it needs no firewall call
+        return text
+
+    def test_on_by_default_without_any_state(self):
+        text = self.rendered({})
+        self.assertEqual(text, plugin.RULE)
+        self.assertIn("/firewall open", text)
+        self.assertLess(len(text), 4000)  # Hermes skips longer sections
+        self.assertNotIn("Internet", text)  # no state: a frozen state would go stale
+
+    def test_can_be_switched_off(self):
+        self.assertEqual(self.rendered({"prompt_rule": False}), "")  # empty: Hermes adds nothing
+
+    def test_section_id_is_valid_for_hermes(self):
+        ctx = Hermes()
+        plugin.register(ctx)
+        for name in ctx.sections:
+            self.assertRegex(name, r"^[a-z0-9._-]{1,128}$")
+
+    def test_older_hermes_without_sections_still_loads(self):
+        ctx = Context()
+        plugin.register(ctx)
+        self.assertEqual(ctx.commands, [("firewall", plugin.handle)])
+
+
+class StatusLineTests(unittest.TestCase):
+    def hook(self, settings):
+        ctx = Context(settings)
+        plugin.register(ctx)
+        return dict(ctx.hooks)["pre_llm_call"]
+
+    def call(self, hook, content, now=1000):
+        with tempfile.TemporaryDirectory() as directory, patch.object(plugin, "STATE", Path(directory)), \
+             patch.object(plugin, "profile_name", return_value="research"), patch.object(plugin.time, "time", return_value=now), \
+             patch.object(plugin.subprocess, "run") as run:
+            if content is not None:
+                (Path(directory) / "research.json").write_text(content)
+            answer = hook(session_id="s", user_message="hi", telemetry_schema_version="x")
+        run.assert_not_called()  # never sudo, not once per turn
+        return answer
+
+    def test_off_by_default(self):
+        self.assertIsNone(self.call(self.hook({}), json.dumps({"internet": None, "lan": None})))
+
+    def test_shows_the_current_state_when_switched_on(self):
+        hook = self.hook({"status_line": True})
+        for leases, expected in (({"internet": None, "lan": None}, "Internet closed, LAN closed"),
+                                 ({"internet": 3460, "lan": None}, "Internet open for 41m, LAN closed"),
+                                 ({"internet": None, "lan": 1030}, "Internet closed, LAN open for 30s"),
+                                 ({"internet": 8380, "lan": 8380}, "Internet open for 2h 03m, LAN open for 2h 03m")):
+            with self.subTest(leases=leases):
+                self.assertEqual(self.call(hook, json.dumps(leases)), f"[hermes-firewall] Sandbox firewall: {expected}.")
+
+    def test_expired_lease_reads_closed_without_a_new_file(self):
+        hook = self.hook({"status_line": True})
+        self.assertIn("Internet closed", self.call(hook, json.dumps({"internet": 999, "lan": None})))
+        self.assertIn("Internet closed", self.call(hook, json.dumps({"internet": 1000, "lan": None})))
+
+    def test_unknown_state_adds_nothing(self):
+        hook = self.hook({"status_line": True})
+        for content in (None, "", "not json", "[]", "{}", '{"internet": "soon", "lan": null}'):
+            with self.subTest(content=content):
+                self.assertIsNone(self.call(hook, content))
+
+
 class PluginTests(unittest.TestCase):
     def run_handle(self, raw, output=result("research: firewall active, Internet closed, LAN closed\n")):
         with patch.object(plugin, "profile_name", return_value="research"), \
@@ -140,7 +222,7 @@ class PluginTests(unittest.TestCase):
         ctx = Context()
         plugin.register(ctx)
         self.assertEqual(ctx.commands, [("firewall", plugin.handle)])
-        self.assertEqual([name for name, _ in ctx.hooks], ["transform_terminal_output"])
+        self.assertEqual([name for name, _ in ctx.hooks], ["transform_terminal_output", "pre_llm_call"])
         self.assertFalse(hasattr(ctx, "tools"))
 
     def test_manifest_matches(self):
@@ -149,6 +231,10 @@ class PluginTests(unittest.TestCase):
         firewall = (ROOT / "hermes_firewall.py").read_text()
         version = firewall.split('VERSION = "', 1)[1].split('"', 1)[0]
         self.assertIn(f"version: {version}\n", manifest)
+        ctx = Context()
+        plugin.register(ctx)
+        for name, _ in ctx.hooks:
+            self.assertIn(f"  - {name}\n", manifest)
 
 
 if __name__ == "__main__":

@@ -44,13 +44,25 @@ sudo hermes-firewall add default
 
 `add` connects the profile's sandbox to its firewall network, installs the `/firewall` command into that profile and allows it to open and close exactly this profile's firewall (`/etc/sudoers.d/hermes-firewall`). Running Hermes processes load plugins only when they start: restart the gateway (`hermes -p default gateway restart`, for Telegram, Discord, ...) and the backend of the desktop app (`hermes -p default dashboard --stop`, then start it again), then start a new chat.
 
-Optional, per profile (off by default): tell the agent when the firewall blocked a command.
+### What the agent is told
+
+Three settings per profile decide what the model learns about the firewall. Set them like this:
 
 ```bash
+hermes -p default config set plugins.entries.hermes-firewall.settings.prompt_rule false
+hermes -p default config set plugins.entries.hermes-firewall.settings.status_line true
 hermes -p default config set plugins.entries.hermes-firewall.settings.agent_notice true
 ```
 
-Then a sandbox command that fails with a network error while the firewall is closed gets one line appended to its output: what is closed and that only the user can open it with `/firewall`, so the model asks instead of guessing or trying to work around it. Nothing is added to the prompt or to any other output, and the model still cannot open anything. Switching it on or off needs no restart once the plugin is loaded.
+| Setting | Default | What the model gets | Cost |
+|---|---|---|---|
+| `prompt_rule` | on | The rule in the frozen part of the system prompt of new sessions: there is a firewall, an immediate refusal usually means it is closed, only the user can open it. Never says whether it is open or closed, so it cannot go stale. | One short paragraph, once per session, cached with the prompt |
+| `status_line` | off | The current state as one line on every user message, e.g. `Internet closed, LAN open for 41m`. | About 15 tokens per message; the lines stay in the history until compaction |
+| `agent_notice` | off | One line on a command that failed with a network error while the firewall is closed. | Only when that happens |
+
+`prompt_rule` needs Hermes 0.22.5 or newer and applies to new sessions; on older versions it is left out. `status_line` reads `/run/hermes-firewall/PROFILE.json` without sudo; this file only reports what the kernel enforces. It is refreshed on every `open` and `close` and by the 5-minute timer, and a lease that runs out reads as closed without a new file. The model can never open anything, whatever these settings say.
+
+`status_line` and `agent_notice` take effect without a restart once the plugin is loaded.
 
 ## Usage
 

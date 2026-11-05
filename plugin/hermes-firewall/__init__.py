@@ -5,16 +5,26 @@ Installed into a profile by 'sudo hermes-firewall add PROFILE'. It only calls
 allows for this profile in /etc/sudoers.d/hermes-firewall. A slash command,
 not a tool: only the user can run it, never the model.
 
-Optional (plugins.entries.hermes-firewall.settings.agent_notice: true): when a
-sandbox command fails with a network error while the firewall is closed, one
-line is added to that command's output, so the model knows why and asks the
-user. Nothing is added to any other output or to the prompt."""
+What the model is told, per setting in plugins.entries.hermes-firewall.settings:
+- prompt_rule (on by default): the rule, without any state, in the frozen part
+  of the system prompt of new sessions. It costs nothing per turn and cannot go
+  stale.
+- status_line (off by default): the current state as one line on every user
+  message, read from a file without sudo. It stays in the history.
+- agent_notice (off by default): one line on the output of a sandbox command
+  that failed with a network error while the firewall is closed."""
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import time
 
 EXE = "/usr/local/bin/hermes-firewall"
+STATE = Path("/run/hermes-firewall")
+RULE = ("Your terminal sandbox is behind a firewall. A connection that is refused or reset at once usually means "
+        "it is closed; names still resolve. Only the user can open it (/firewall open [lan|all] [duration]): "
+        "ask them if the task needs the network, and do not try to work around it.")
 USAGE = """/firewall open                 Internet for the default time (usually 1h)
 /firewall open 30m             Internet for 30 minutes
 /firewall open lan 2h          LAN for 2 hours (also: internet, all)
@@ -99,6 +109,37 @@ def notice(states):
             "ask them if the task needs the network. Do not try to work around it.")
 
 
+def lease_text(end, now):
+    if end is None or end <= now:
+        return "closed"
+    seconds = end - now
+    if seconds >= 3600:
+        hours, minutes = divmod(seconds // 60, 60)
+        return f"open for {hours}h {minutes:02d}m"
+    return f"open for {seconds // 60}m" if seconds >= 60 else f"open for {seconds}s"
+
+
+def status_line(profile):
+    """The current state from the file hermes-firewall keeps, or None if it is unknown."""
+    try:
+        ends = json.loads((STATE / f"{profile}.json").read_text(encoding="utf-8"))
+        now = int(time.time())
+        return (f"[hermes-firewall] Sandbox firewall: Internet {lease_text(ends['internet'], now)}, "
+                f"LAN {lease_text(ends['lan'], now)}.")
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def make_status_hook(enabled):
+    """pre_llm_call: the current state as one line on the user message of this turn."""
+    def hook(**kwargs):
+        if not enabled():
+            return None
+        profile = profile_name()
+        return status_line(profile) if profile else None
+    return hook
+
+
 def make_output_hook(enabled):
     """transform_terminal_output: add one line to a sandbox command that failed on a closed network."""
     def hook(command="", output="", returncode=None, env_type="", **kwargs):
@@ -115,9 +156,13 @@ def make_output_hook(enabled):
 def register(ctx):
     ctx.register_command("firewall", handle, description="Open, close or show the sandbox firewall",
                          args_hint="open [internet|lan|all] [30m|2h] | close | status")
-    def enabled():
+    def setting(name, default=False):
         try:
-            return ctx.get_config("agent_notice", False) is True
+            return ctx.get_config(name, default) is True
         except Exception:
             return False
-    ctx.register_hook("transform_terminal_output", make_output_hook(enabled))
+    ctx.register_hook("transform_terminal_output", make_output_hook(lambda: setting("agent_notice")))
+    ctx.register_hook("pre_llm_call", make_status_hook(lambda: setting("status_line")))
+    if hasattr(ctx, "register_system_prompt_section"):  # older Hermes: no frozen section
+        ctx.register_system_prompt_section("hermes-firewall.rule",
+                                           lambda info: RULE if setting("prompt_rule", True) else "")

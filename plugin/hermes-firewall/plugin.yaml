@@ -4,3 +4,4 @@ description: "/firewall: open, close and show the sandbox firewall of this profi
 author: hermes-firewall contributors
 provides_hooks:
   - transform_terminal_output
+  - pre_llm_call

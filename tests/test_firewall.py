@@ -45,6 +45,15 @@ def load(text):
         return fw.load_config(config_file(directory, text))
 
 
+def setUpModule():
+    # Tests also run as root (tests/distros.sh): never touch the real /run/hermes-firewall.
+    directory = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(directory.cleanup)
+    state = patch.object(fw, "STATE", Path(directory.name) / "run")
+    state.start()
+    unittest.addModuleCleanup(state.stop)
+
+
 class IdentityAndInputTests(unittest.TestCase):
     def test_identity_is_deterministic_and_fits_linux_limits(self):
         name = "a" * 64
@@ -872,6 +881,56 @@ class ProgramPathTests(unittest.TestCase):
         self.assertIn("can be changed by non-root users", output.call_args.args[0])
 
 
+class StateFileTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.state = Path(directory.name) / "run"
+        item = patch.object(fw, "STATE", self.state)
+        item.start()
+        self.addCleanup(item.stop)
+
+    def read(self, profile="research"):
+        return json.loads((self.state / f"{profile}.json").read_text())
+
+    def test_holds_end_times_readable_by_everyone(self):
+        with patch.object(fw, "lease_remaining", side_effect=lambda p, kind: 600 if kind == "lan" else None), \
+             patch.object(fw.time, "time", return_value=1000):
+            fw.write_state("research")
+        self.assertEqual(self.read(), {"internet": None, "lan": 1600})
+        self.assertEqual(self.state.stat().st_mode & 0o777, 0o755)
+        self.assertEqual((self.state / "research.json").stat().st_mode & 0o777, 0o644)
+
+    def test_failure_only_warns_because_the_lease_is_already_in_the_kernel(self):
+        with patch.object(fw, "lease_remaining", side_effect=fw.FirewallError("nft failed")), \
+             patch("builtins.print") as output:
+            fw.write_state("research")
+        self.assertIn("nft failed", output.call_args.args[0])
+        self.assertFalse((self.state / "research.json").exists())
+
+    def test_open_and_close_report_the_new_state_after_applying_it(self):
+        order = []
+        with patch.object(fw, "load_config", return_value=CONF), patch.object(fw, "health"), \
+             patch.object(fw, "docker_ready"), patch.object(fw, "check_network"), \
+             patch.object(fw, "nft_apply", side_effect=lambda text: order.append("nft")), \
+             patch.object(fw, "write_state", side_effect=lambda profile: order.append(profile)), \
+             patch.object(fw, "profile_line", return_value=""), patch("builtins.print"):
+            fw.open_lease(registry("research"), "research", ["lan"])
+            fw.close_lease(registry("research"), "research", [])
+        self.assertEqual(order, ["nft", "research", "nft", "research"])
+
+    def test_restore_reports_every_profile_as_closed(self):
+        lock = os.stat_result((0o100600, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        with tempfile.TemporaryDirectory() as directory, patch.object(fw, "LOCK", Path(directory) / "lock"), \
+             patch.object(fw.os, "geteuid", return_value=0), patch.object(fw.os, "fstat", return_value=lock), \
+             patch.object(fw, "load_registry", return_value=registry("research", "work")), \
+             patch.object(fw, "restore_transaction", return_value=""), patch.object(fw, "nft_apply"), \
+             patch.object(fw, "lease_remaining", return_value=None), patch("builtins.print"):
+            fw.main(["restore"])
+        self.assertEqual(self.read("research"), {"internet": None, "lan": None})
+        self.assertEqual(self.read("work"), {"internet": None, "lan": None})
+
+
 class SudoArgumentFuzzTests(unittest.TestCase):
     """sudoers allows 'open P *' and 'close P *': whatever follows must either be a valid lease
     request or fail before anything changes."""
@@ -897,7 +956,7 @@ class SudoArgumentFuzzTests(unittest.TestCase):
              patch.object(fw, "load_config", return_value=CONF), patch.object(fw, "health"), patch.object(fw, "docker_ready"), \
              patch.object(fw, "check_network"), patch.object(fw, "profile_line", return_value=""), \
              patch.object(fw, "nft_apply", side_effect=applied.append), patch.object(fw, "run") as run, \
-             patch("builtins.print"):
+             patch.object(fw, "write_state"), patch("builtins.print"):
             try:
                 fw.main(argv)
                 error = None

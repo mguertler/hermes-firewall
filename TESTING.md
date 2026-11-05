@@ -60,7 +60,8 @@ Not covered automatically; record the result (distribution, versions, date) belo
 5. IPv6 (host with IPv6): `open` reaches IPv6 sites, closed does not.
 6. Hermes egress proxy (`hermes egress setup/start`, `proxy.enforce_on_docker false`): reachable from the sandbox in every state, other host ports and its management port not.
 7. `sudo ./install.sh` again (upgrade) keeps leases open; `uninstall.sh` and `--purge`.
-8. Distributions: Debian 13, Ubuntu 24.04, Fedora, Arch, openSUSE (install, add, open, close).
+8. What the agent is told, in a real Hermes session: `/context` or `HERMES_DUMP_REQUESTS=true` shows the rule once in the system prompt with `prompt_rule` on and not with it off; with `status_line` on, every user message carries the current state, also after `/firewall open` and after a lease ran out.
+9. Distributions: Debian 13, Ubuntu 24.04, Fedora, Arch, openSUSE (install, add, open, close).
 
 ## Results
 
@@ -80,5 +81,7 @@ Not covered automatically; record the result (distribution, versions, date) belo
 | 2026-10-27 | manual 7 (uninstall refused with profiles; keeps config.toml; reinstall uses it; --purge leaves nothing; Docker keeps running) | test VM | pass |
 | 2026-10-27 | agent notice: off = untouched output; on = one line on curl timeout with closed firewall, model (ministral-3:8b) then asks for `/firewall open`; needs a fresh gateway after plugin updates | test VM | pass |
 | 2026-10-27 | reject instead of drop: netns.sh (all blocked targets refused at once) with nft 1.1.3 and nft 1.0.6 (Debian 12); real `health()` against loaded tables with both versions | local, rootless | pass |
+| 2026-11-05 | prompt rule and status line: unit tests, netns.sh, shellcheck; status file against real nft 1.1.3 (closed, open, expiry); Hermes interfaces checked against its source only | local, rootless | pass |
+| | live: rule and status line in a real Hermes session (manual 8) | | **not done yet** |
 | | live: reject on the test VM (integration.sh expects refusals and a reset on expiry) | | **not done yet** |
-| | a full provider request through iron-proxy (needs a real API key); manual 8 live on other distributions (containers: pass) | | **not done** |
+| | a full provider request through iron-proxy (needs a real API key); manual 9 live on other distributions (containers: pass) | | **not done** |

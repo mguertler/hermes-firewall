@@ -72,6 +72,7 @@ Index of `hermes_firewall.py` (in file order) and the plugin. Keep it in sync wh
 | `health(profile)` | Hooks, priorities and rule counts of a table match `rules()`. |
 | `set_elements(profile, name)` | Current elements of a set (for `--verbose`). |
 | `lease_remaining(profile, kind)` | Seconds left or `None` (closed). |
+| `write_state(profile)` | Lease end times to `/run/hermes-firewall/PROFILE.json` for the status line; a failure only warns. |
 
 ## Wording
 
@@ -147,4 +148,7 @@ Index of `hermes_firewall.py` (in file order) and the plugin. Keep it in sync wh
 | `lease_states(profile)` | Internet/LAN state from `status PROFILE`, or `None`. |
 | `notice(states)` | The one line added for the model. |
 | `make_output_hook(enabled)` | `transform_terminal_output` hook of the optional agent notice. |
-| `register(ctx)` | Registers `/firewall` and the (setting-gated) output hook. |
+| `lease_text(end, now)` | `closed` or `open for 41m` from an end time. |
+| `status_line(profile)` | One line with the current state from the status file, or `None` if unknown. |
+| `make_status_hook(enabled)` | `pre_llm_call` hook of the optional status line. |
+| `register(ctx)` | Registers `/firewall`, the frozen rule (`RULE`) and the setting-gated hooks. |

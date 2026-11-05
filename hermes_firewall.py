@@ -39,6 +39,7 @@ REFRESH_UNIT = Path("/etc/systemd/system/hermes-firewall-refresh.service")
 REFRESH_TIMER = Path("/etc/systemd/system/hermes-firewall-refresh.timer")
 SUDOERS = Path("/etc/sudoers.d/hermes-firewall")
 LOCK = Path("/run/lock/hermes-firewall.lock")
+STATE = Path("/run/hermes-firewall")
 KINDS = ("internet", "lan")
 LABEL = "hermes-firewall.profile"
 PROFILE_RE = r"[a-z0-9][a-z0-9_-]{0,63}"  # Hermes' own profile id rule
@@ -808,6 +809,20 @@ def lease_remaining(profile, kind="internet"):
     raise FirewallError(f"Lease set missing for {profile}.")
 
 
+def write_state(profile):
+    """Lease end times for the plugin's status line, readable without sudo. The kernel decides, this
+    only reports: a failure just warns, and the next refresh writes the file again."""
+    try:
+        now = int(time.time())
+        remaining = {kind: lease_remaining(profile, kind) for kind in KINDS}
+        STATE.mkdir(exist_ok=True)
+        STATE.chmod(0o755)
+        atomic_write(STATE / f"{profile}.json",
+                     json.dumps({k: None if s is None else now + s for k, s in remaining.items()}) + "\n")
+    except (FirewallError, OSError, KeyError, ValueError, subprocess.SubprocessError) as error:
+        print(f"WARNING: status file of {profile} not written: {error}", file=sys.stderr)
+
+
 # --- wording -------------------------------------------------------------------------------
 
 def left(seconds):
@@ -1207,6 +1222,7 @@ def add_profile(data, profile, user, yes=False):
     write_sudoers(data)
     for message in [*info["hints"], *protect_sandboxes(profile, data["profiles"][profile], conf, True, yes)]:
         print(message)
+    write_state(profile)
     print(profile_line(profile))
     print(restart_hint(profile) + "\n"
           "In the chat: /firewall open, /firewall open lan 30m, /firewall close, /firewall status")
@@ -1229,6 +1245,7 @@ def remove_profile(data, profile):
         run("docker", "network", "rm", item["network"])
     require(not interface_exists(item["bridge"]), f"Bridge still exists: {item['bridge']}; protection kept.")
     nft_apply(drop_table(item["table"]))
+    (STATE / f"{profile}.json").unlink(missing_ok=True)
     del data["profiles"][profile]
     save_registry(data)
     write_sudoers(data)
@@ -1244,6 +1261,7 @@ def open_lease(data, profile, words):
     docker_ready()
     check_network(profile, record)
     nft_apply(lease_transaction(profile, kinds, seconds))
+    write_state(profile)
     print(profile_line(profile))
 
 
@@ -1251,6 +1269,7 @@ def close_lease(data, profile, words):
     record_of(data, profile)
     require(len(words) <= 1, "Usage: hermes-firewall close PROFILE [internet|lan|all]")
     nft_apply(lease_transaction(profile, lease_kinds(words[0] if words else "all")))
+    write_state(profile)
     print(profile_line(profile))
 
 
@@ -1332,6 +1351,7 @@ def refresh(data):
                 save_registry(data)
         attempt(profile, follow_dns)
         attempt(profile, lambda: [print(m) for m in protect_sandboxes(profile, record, conf)])
+        write_state(profile)
     require(not problems, "; ".join(problems))
 
 
@@ -1450,6 +1470,7 @@ def upgrade(bundle):
             record["dns"] = conf["dns"]
         except (FirewallError, KeyError) as error:
             print(f"WARNING: Hermes profile {profile} not updated: {error}", file=sys.stderr)
+        write_state(profile)
     save_registry(data)
     for warning in flush_warnings():
         print(warning)
@@ -1474,10 +1495,10 @@ def uninstall(data, purge=False):
     run("systemctl", "disable", "--now", REFRESH_TIMER.name, check=False)
     run("systemctl", "stop", SERVICE)
     run("systemctl", "disable", SERVICE)
-    for path in (UNIT, REFRESH_UNIT, REFRESH_TIMER, SUDOERS, REGISTRY, CACHE, EXE,
+    for path in (UNIT, REFRESH_UNIT, REFRESH_TIMER, SUDOERS, REGISTRY, CACHE, EXE, *STATE.glob("*.json"),
                  *(SHARE / "plugin" / name for name in PLUGIN_FILES)):
         path.unlink(missing_ok=True)
-    for folder in (SHARE / "plugin", SHARE):
+    for folder in (SHARE / "plugin", SHARE, STATE):
         if folder.exists():
             folder.rmdir()
     if purge:
@@ -1562,6 +1583,8 @@ def main(argv=None):
         if verb == "restore" and not rest:
             # One atomic transaction; all leases intentionally reset on boot/restore.
             nft_apply(restore_transaction(data))
+            for profile in sorted(data["profiles"]):
+                write_state(profile)
             print("All leases of all protected profiles are closed.")
         elif verb == "refresh" and not rest:
             refresh(data)
