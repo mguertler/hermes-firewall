@@ -64,6 +64,25 @@ MCP_SUBNET = "172.31.240.0/20"
 NO_DNS = "192.0.2.1"
 # A name stays allowed this long after it last resolved to an address (services rotate their addresses).
 MCP_ADDRESS_KEEP = 86400
+# status --proof: public addresses to try. Blocked attempts never leave the host; allowed ones really connect.
+PROOF_PUBLIC = {4: ("1.1.1.1", "9.9.9.9", "8.8.8.8"), 6: ("2606:4700:4700::1111", "2620:fe::fe", "2001:4860:4860::8888")}
+# One connection attempt from the test endpoint; prints open, refused or timeout.
+PROOF_PROBE = """import socket, sys
+kind, host, port = sys.argv[1:]
+family = socket.AF_INET6 if ":" in host else socket.AF_INET
+s = socket.socket(family, socket.SOCK_STREAM if kind == "tcp" else socket.SOCK_DGRAM)
+s.settimeout(3)
+try:
+    s.connect((host, int(port)))
+    if kind == "udp":
+        s.send(bytes.fromhex("000101000001000000000000000001" "0001"))
+        s.recv(512)
+    print("open")
+except socket.timeout:
+    print("timeout")
+except OSError:
+    print("refused")
+"""
 # Docker options that let code leave any container, whatever its network.
 ESCAPES = r"--privileged\S*|\S*docker\.sock\S*|--pid[= ]host|--userns[= ]host|--cap-add[= ](?:ALL|SYS_ADMIN)"
 # Interfaces whose networks never count as LAN for lan.networks = ["auto"].
@@ -1743,7 +1762,185 @@ def mcp_remove(data, profile, server):
     print(f"{key}: firewall removed. {' '.join(note)}".strip())
 
 
-def status(data, user=None, selected=None, verbose=False):
+# --- status --proof ---------------------------------------------------------------------------
+
+def reject_count(table, chain, kind):
+    """Packets of this kind (tcp or not) that one chain has refused so far. Only the matching rules: a
+    new interface sends IPv6 multicast to the host by itself, which host_input_guard refuses as well."""
+    data = json.loads(run("nft", "--json", "list", "chain", "inet", table, chain).stdout)
+    total = 0
+    for row in data["nftables"]:
+        expr = row["rule"]["expr"] if "rule" in row else []
+        rejects = [item["reject"] for item in expr if "reject" in item]
+        if rejects and (rejects[0].get("type") == "tcp reset") == (kind == "tcp"):
+            total += sum(item["counter"]["packets"] for item in expr if "counter" in item)
+    return total
+
+
+def probe_verdict(answer, refused):
+    """Did the firewall stop this attempt? The counter decides, so a target that is down or refuses
+    by itself does not count as blocked. An answer always means it got through."""
+    return "blocked" if answer != "open" and refused else "passed"
+
+
+def in_networks(address, networks):
+    return any(ipaddress.ip_address(address) in network for network in networks)
+
+
+def net_list(items):
+    """Networks from set elements and config entries; ranges of auto-merged sets become their first address."""
+    return [ipaddress.ip_network(str(item).split("-")[0], strict=False) for item in items]
+
+
+def public_target(version, avoid):
+    """A public address that no allow list opens, or None."""
+    return next((a for a in PROOF_PUBLIC[version] if not in_networks(a, avoid)), None)
+
+
+def host_addresses():
+    """The host's own addresses outside Docker, IPv4 first."""
+    found = [item["local"] for link in json.loads(run("ip", "-j", "addr", "show").stdout)
+             if not link.get("ifname", "").startswith(VIRTUAL_INTERFACES)
+             for item in link.get("addr_info", []) if item.get("scope") == "global"]
+    return sorted(found, key=family)
+
+
+def lan_targets(elements, ipv6, avoid, local):
+    """One address per family in the LAN, not the host itself: the router if it is in there."""
+    routers = [r["gateway"] for version in ("-4", "-6")
+               for r in json.loads(run("ip", "-j", version, "route", "show", "default").stdout or "[]") if r.get("gateway")]
+    found = []
+    for version in (4, 6) if ipv6 else (4,):
+        # IPv6 prefixes longer than /64 are NAT64-embedded IPv4 networks or single hosts.
+        networks = [n for n in net_list(elements) if n.version == version and (version == 4 or n.prefixlen <= 64)]
+        candidates = [r for r in routers if family(r) == version and in_networks(r, networks)]
+        candidates += [str(a) for n in networks for _, a in zip(range(4), n.hosts())]
+        found += [a for a in candidates if a not in local and not in_networks(a, avoid)][:1]
+    return found
+
+
+def proof_targets(name, record, conf):
+    """What to try from this firewall's network: [(label, kind, address, port, expected)]."""
+    ipv6, local = record["ipv6"], host_addresses()
+    usable = [v for v in (4, 6) if v == 4 or ipv6]
+    wanted = []
+    if "/" in name:
+        addresses = mcp_addresses(conf)
+        entries = []
+        for target in conf["mcp"].get(name, []):
+            nets = net_list([target["net"]] if "net" in target else addresses.get(target["host"], []))
+            entries += [(n, target) for n in nets]
+        avoid = allowed_nets = [n for n, _ in entries]
+        lan_elements = [n for item in conf["lan_networks"] for n in (host_networks() if item == "auto" else [item])]
+        internet, lan, dns = "blocked", "blocked", "passed" if mcp_dns(conf, name) != [NO_DNS] else "blocked"
+        for network, target in entries:
+            if network.version in usable:
+                address = str(next(iter(network.hosts()), network[0]))
+                kind = "tcp" if target["tcp"] else "udp"
+                wanted.append(("allowed target", kind, address, target[kind][0], "passed"))
+        allowed = [w for w in wanted if w[1] == "tcp"]
+        if allowed:
+            listed = {t for _, target in entries for t in target["tcp"]}
+            wanted.append(("other port", "tcp", allowed[0][2], next(p for p in (9, 19, 7, 13, 37) if p not in listed), "blocked"))
+    else:
+        allowed_nets = net_list(e["net"] for e in conf["allow"])
+        internet = "passed" if lease_remaining(name, "internet") is not None else "blocked"
+        lan = "passed" if lease_remaining(name, "lan") is not None else "blocked"
+        dns = "passed"
+        lan_elements = set_elements(name, "lan_v4") + (set_elements(name, "lan_v6") if ipv6 else [])
+        avoid = allowed_nets + net_list(lan_elements)
+    wanted += [("Internet", "tcp", address, 443, internet)
+               for address in (public_target(v, avoid) for v in usable) if address]
+    wanted += [("LAN", "tcp", address, 443, lan)
+               for address in lan_targets(lan_elements, ipv6, allowed_nets, local)]
+    gateways = [c["Gateway"] for c in network_config(name) if c.get("Gateway")]
+    wanted += [("host", "tcp", address, 22, "blocked") for address in [*local[:1], *gateways[:1]]]
+    servers = [s for s in conf["dns"] if family(s) in usable and not in_networks(s, avoid if "/" in name else [])]
+    wanted += [("DNS", "udp", servers[0], 53, dns)] if servers else []
+    return wanted
+
+
+def network_config(name):
+    """Subnets and gateways of the firewall's Docker network, with the addresses in use."""
+    network = json.loads(run("docker", "network", "inspect", identity(name)["network"]).stdout)[0]
+    used = {c.get(key, "").split("/")[0] for c in (network.get("Containers") or {}).values()
+            for key in ("IPv4Address", "IPv6Address")}
+    config = [dict(c) for c in (network.get("IPAM") or {}).get("Config") or [] if c.get("Subnet")]
+    for item in config:
+        item["used"] = sorted(used - {""})
+    return config
+
+
+class ProofEndpoint:
+    """A temporary network namespace on the firewall's bridge: packets from it take the same way as a
+    container's. It lives in a process, so it disappears with that process, also after a crash."""
+    def __init__(self, name):
+        self.name, self.item, self.process = name, identity(name), None
+        self.link = "hfwp" + self.item["bridge"][3:14]
+
+    def __enter__(self):
+        run("ip", "link", "del", self.link, check=False)  # left by a crash less than 5 minutes ago
+        self.process = subprocess.Popen([shutil.which("unshare", path=ENV["PATH"]) or "unshare", "-n", "sleep", "300"],
+                                        env=ENV, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self.prepare()
+        except Exception:
+            self.__exit__()
+            raise
+        return self
+
+    def prepare(self):
+        pid = str(self.process.pid)
+        deadline = time.monotonic() + 3
+        while os.readlink(f"/proc/{pid}/ns/net") == os.readlink("/proc/self/ns/net"):
+            require(self.process.poll() is None and time.monotonic() < deadline, "no test network namespace")
+            time.sleep(0.02)
+        run("ip", "link", "add", self.link, "type", "veth", "peer", "name", "eth0", "netns", pid)
+        run("ip", "link", "set", self.link, "master", self.item["bridge"], "up")
+        self.inside("ip", "link", "set", "lo", "up")
+        self.inside("ip", "link", "set", "eth0", "up")
+        for config in network_config(self.name):
+            network = ipaddress.ip_network(config["Subnet"])
+            # From the top of the subnet: Docker hands out addresses from the bottom.
+            address = next(a for a in (network[-2 - i] for i in range(8)) if str(a) not in config["used"])
+            extra = ["nodad"] if network.version == 6 else []
+            self.inside("ip", f"-{network.version}", "addr", "add", f"{address}/{network.prefixlen}", "dev", "eth0", *extra)
+            gateway = config.get("Gateway") or str(network[1])
+            self.inside("ip", f"-{network.version}", "route", "add", "default", "via", gateway)
+
+    def inside(self, *arguments):
+        return run("nsenter", "-t", str(self.process.pid), "-n", *arguments)
+
+    def attempt(self, chain, kind, address, port):
+        """Try one connection -> (answer, packets this chain refused meanwhile)."""
+        before = reject_count(self.item["table"], chain, kind)
+        answer = self.inside("python3", "-I", "-c", PROOF_PROBE, kind, address, str(port)).stdout.strip()
+        return answer, reject_count(self.item["table"], chain, kind) - before
+
+    def __exit__(self, *details):
+        self.process.kill()
+        self.process.wait()
+        run("ip", "link", "del", self.link, check=False)
+
+
+def prove(name, record, conf):
+    """Test the firewall with real packets -> (the line for the user, did it hold?)."""
+    try:
+        wanted = proof_targets(name, record, conf)
+        with ProofEndpoint(name) as endpoint:
+            results = [(*target, probe_verdict(*endpoint.attempt("host_input_guard" if target[0] == "host" else "outbound",
+                                                                 *target[1:4]))) for target in wanted]
+    except (FirewallError, OSError, KeyError, ValueError, IndexError, StopIteration, subprocess.SubprocessError) as error:
+        return f"proof: not tested ({str(error).splitlines()[0] if str(error) else type(error).__name__})", True
+    wrong = [f"{label} {address} port {port} should be {expected}, was {got}"
+             for label, _, address, port, expected, got in results if got != expected]
+    if wrong:
+        return "PROOF FAILED: " + "; ".join(wrong), False
+    labels = dict.fromkeys(f"{label} {expected}" for label, _, _, _, expected, _ in results)
+    return "proof: " + ", ".join(labels), True
+
+
+def status(data, user=None, selected=None, verbose=False, proof=False):
     if selected:
         record_of(data, selected)
         profiles = [selected]
@@ -1781,6 +1978,11 @@ def status(data, user=None, selected=None, verbose=False):
         print(f"{indent}{profile_line(profile)}")
         for message in messages:
             print(f"{indent}{message}")
+        if proof:
+            line, held = prove(profile, data["profiles"][profile], conf)
+            print(f"{indent}  {line}")
+            if not held:
+                problems.append(profile)
         if verbose:
             item = identity(profile)
             print(f"{indent}  network {item['network']}, bridge {item['bridge']}, table inet {item['table']}, "
@@ -1820,6 +2022,11 @@ def status(data, user=None, selected=None, verbose=False):
         print(f"  {key}: firewall active, can reach only: {allowed_text(conf, key)}")
         if key not in conf["mcp"]:
             print(f"  {key}: WARNING - no [[mcp]] entry in {CONFIG}, so it reaches nothing.")
+        if proof:
+            line, held = prove(key, record, conf)
+            print(f"    {line}")
+            if not held:
+                problems.append(key)
         if verbose:
             item = identity(key)
             print(f"    network {item['network']} ({record['subnet']}), bridge {item['bridge']}, table inet {item['table']}")
@@ -2037,7 +2244,7 @@ USAGE = """usage:
   hermes-firewall add PROFILE                     protect a Hermes profile (everything closed)
   hermes-firewall open PROFILE [for] [internet|lan|all] [DURATION]
   hermes-firewall close PROFILE [internet|lan|all]
-  hermes-firewall status [PROFILE] [--verbose]
+  hermes-firewall status [PROFILE] [--verbose] [--proof]   --proof tests each firewall with real packets
   hermes-firewall remove PROFILE                  remove the firewall; the sandbox then has no network
   hermes-firewall mcp scan PROFILE                what the profile's MCP servers can reach
   hermes-firewall mcp add PROFILE SERVER          lock a Docker MCP server to an allow list (asks for it if there is none)
@@ -2064,7 +2271,7 @@ def parse(argv):
     """-> (words, options). Options are only accepted where they are listed."""
     words = [a for a in argv if not a.startswith("-")]
     options = {a.split("=", 1)[0]: a.split("=", 1)[1] if "=" in a else True for a in argv if a.startswith("-")}
-    allowed = {"add": {"--yes"}, "status": {"--verbose"}, "uninstall": {"--purge"},
+    allowed = {"add": {"--yes"}, "status": {"--verbose", "--proof"}, "uninstall": {"--purge"},
                "install": {"--bundle"}, "upgrade": {"--bundle"}}
     verb = words[0] if words else "status"
     # open/close are allowed via sudoers with any arguments: they take no options at all.
@@ -2120,7 +2327,7 @@ def main(argv=None):
             uninstall(data, "--purge" in options)
         elif verb == "status" and len(rest) <= 1:
             user = hermes_user() if os.environ.get("SUDO_USER") and not rest else None
-            status(data, user, rest[0] if rest else None, "--verbose" in options)
+            status(data, user, rest[0] if rest else None, "--verbose" in options, "--proof" in options)
         elif verb == "add" and len(rest) == 1:
             add_profile(data, rest[0], hermes_user(), "--yes" in options)
         elif verb == "remove" and len(rest) == 1:

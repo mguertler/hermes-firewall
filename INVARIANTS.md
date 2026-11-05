@@ -14,6 +14,7 @@ These must stay true. Change them only deliberately, together with tests and doc
 - Connections a sandbox may not make are refused at once (TCP reset, otherwise ICMP admin-prohibited), never left to time out; traffic from outside to a sandbox is dropped silently.
 - Every change of the rules changes the layout fingerprint, so `upgrade` reloads the tables instead of leaving old rules in place.
 - An MCP firewall never opens: no leases, no `open`/`close`, no sudoers rule. Its container reaches only the targets and ports of its allow list in the root-owned `config.toml`, DNS only if that list has names, and never the host. Removing it leaves the server with no network, never an unfiltered one.
+- `status --proof` only ever tests: it adds no rule, opens no lease, leaves nothing behind, and is not reachable through the sudoers rules.
 - `bash tests/netns.sh` must pass after any rule change.
 
 ## Scope of changes

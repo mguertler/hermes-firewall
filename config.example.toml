@@ -2,6 +2,7 @@
 # The installer writes this file once (with the DNS servers it detected);
 # upgrades never change it. After editing: sudo hermes-firewall refresh
 # (changes reach the sandboxes within 5 minutes anyway; open leases stay open).
+# Only docker_requires_firewall takes effect with: sudo ./install.sh
 
 # IPv6 for the sandboxes: "auto" = only if this host has IPv6 Internet access.
 # Decided when a profile is added; later changes need remove + add.

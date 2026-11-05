@@ -71,6 +71,7 @@ sudo hermes-firewall add PROFILE                    protect a profile (everythin
 sudo hermes-firewall open PROFILE [for] [internet|lan|all] [DURATION]
 sudo hermes-firewall close PROFILE [internet|lan|all]
 sudo hermes-firewall status [PROFILE]               two parts: sandbox firewalls, MCP container firewalls
+sudo hermes-firewall status --proof                 also test each firewall with real packets
 sudo hermes-firewall remove PROFILE                 remove the firewall; the sandbox then has no network
 ```
 
@@ -148,6 +149,25 @@ Limits you should know:
 - Names are only as exact as IP addresses. The firewall opens the addresses a name resolves to (all seen in the last 24 hours, checked every 5 minutes), which on a CDN also reaches other services on the same address. A brand-new address is refused until the next check.
 - A server with a name in its list also gets DNS, so it could leak small amounts of data through DNS queries. A list of only addresses gets no DNS at all, and a lookup there fails after about 5 seconds, so use addresses in that server's own settings.
 - The host itself stays blocked, even if its address is in the list.
+
+## Proving that a firewall holds
+
+`status` checks that the rules are loaded. `status --proof` also tests them with real packets, for every firewall, whether or not a container is running:
+
+```text
+$ sudo hermes-firewall status --proof
+Sandbox firewall (the Docker sandbox of each Hermes profile; open and close change it):
+  default: firewall active, Internet closed, LAN closed
+    proof: Internet blocked, LAN blocked, host blocked, DNS passed
+
+MCP container firewall (one per MCP server in Docker; never opens, only its allow list):
+  default/github: firewall active, can reach only: api.github.com tcp 443
+    proof: allowed target passed, other port blocked, Internet blocked, LAN blocked, host blocked, DNS passed
+```
+
+It briefly attaches a temporary test endpoint to the firewall's Docker network, so its packets take the same way as a container's, and tries a few targets from there. The counters of the blocking rules decide the result, so a target that is down or refuses by itself is not mistaken for the firewall. If a result differs from what the current state should allow, the line says `PROOF FAILED` with the target, and the command fails. `proof: not tested (...)` means the test could not run.
+
+Limits: it tries a sample of targets, not every address. It tests the network, not whether a given container is on it (`status` checks that for sandboxes; for MCP servers it warns about their configuration). Attempts that are allowed really connect, for example to 1.1.1.1 with an open Internet lease; blocked ones never leave the host. It takes a few seconds and is only available to the admin: `/firewall status` and the timer do not use it.
 
 ## Settings
 

@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1264,6 +1265,130 @@ class McpAllowDialogTests(unittest.TestCase):
         self.assertEqual(order, ["asked", "locked", []])
 
 
+class ProofTests(unittest.TestCase):
+    def targets(self, name, conf, internet=None, lan=None, ipv6=False, elements=("192.168.0.0/24",)):
+        def run(*arguments, **kwargs):
+            return result(json.dumps([{"dst": "default", "gateway": "192.168.0.1"}]) if "-4" in arguments else "[]")
+        with patch.object(fw, "run", side_effect=run), patch.object(fw, "host_addresses", return_value=["192.168.0.9"]), \
+             patch.object(fw, "network_config", return_value=[{"Subnet": "172.18.0.0/16", "Gateway": "172.18.0.1", "used": []}]), \
+             patch.object(fw, "lease_remaining", side_effect=lambda p, kind: {"internet": internet, "lan": lan}[kind]), \
+             patch.object(fw, "set_elements", side_effect=lambda p, s: list(elements) if s == "lan_v4" else []), \
+             patch.object(fw, "mcp_addresses", return_value={"api.github.com": ["140.82.112.5"]}):
+            return fw.proof_targets(name, {"ipv6": ipv6}, conf)
+
+    def expected(self, wanted):
+        return {label: {w[4] for w in wanted if w[0] == label} for label, *_ in wanted}
+
+    def test_a_closed_sandbox_must_block_all_but_dns(self):
+        wanted = self.targets("research", {**CONF, "lan_networks": []})
+        self.assertEqual(self.expected(wanted), {"Internet": {"blocked"}, "LAN": {"blocked"}, "host": {"blocked"}, "DNS": {"passed"}})
+        self.assertIn(("LAN", "tcp", "192.168.0.1", 443, "blocked"), wanted)  # the router
+        self.assertIn(("host", "tcp", "192.168.0.9", 22, "blocked"), wanted)
+        self.assertIn(("host", "tcp", "172.18.0.1", 22, "blocked"), wanted)
+        self.assertIn(("DNS", "udp", "192.168.0.5", 53, "passed"), wanted)
+
+    def test_a_lease_changes_only_what_it_opens(self):
+        self.assertEqual(self.expected(self.targets("research", CONF, internet=600))["Internet"], {"passed"})
+        self.assertEqual(self.expected(self.targets("research", CONF, internet=600))["LAN"], {"blocked"})
+        opened = self.expected(self.targets("research", CONF, lan=600))
+        self.assertEqual((opened["Internet"], opened["LAN"], opened["host"]), ({"blocked"}, {"passed"}, {"blocked"}))
+
+    def test_targets_on_an_allow_list_are_not_used(self):
+        conf = {**CONF, "allow": [{"net": "1.1.1.1/32", "tcp": [], "udp": []}, {"net": "192.168.0.1/32", "tcp": [443], "udp": []}]}
+        wanted = self.targets("research", conf)
+        self.assertEqual([w[2] for w in wanted if w[0] == "Internet"], ["9.9.9.9"])
+        self.assertEqual([w[2] for w in wanted if w[0] == "LAN"], ["192.168.0.2"])
+
+    def test_the_host_itself_is_no_lan_target(self):
+        wanted = self.targets("research", CONF, elements=("192.168.0.8/30",))
+        self.assertEqual([w[2] for w in wanted if w[0] == "LAN"], ["192.168.0.10"])
+
+    def test_ipv6_is_tried_only_on_networks_with_ipv6(self):
+        self.assertFalse(any(":" in w[2] for w in self.targets("research", CONF)))
+        self.assertIn(("Internet", "tcp", fw.PROOF_PUBLIC[6][0], 443, "blocked"), self.targets("research", CONF, ipv6=True))
+
+    def test_an_mcp_firewall_opens_only_its_list(self):
+        conf = {**MCP_CONF, "lan_networks": ["192.168.0.0/24"]}
+        wanted = self.targets("research/ips", conf)
+        self.assertIn(("allowed target", "tcp", "203.0.113.5", 8080, "passed"), wanted)
+        self.assertIn(("other port", "tcp", "203.0.113.5", 9, "blocked"), wanted)
+        self.assertEqual(self.expected(wanted)["DNS"], {"blocked"})
+        self.assertEqual(self.expected(wanted)["Internet"], {"blocked"})
+        self.assertEqual(self.expected(wanted)["LAN"], {"blocked"})
+        self.assertEqual(self.expected(wanted)["host"], {"blocked"})
+        named = self.targets("research/github", conf)
+        self.assertEqual(self.expected(named)["DNS"], {"passed"})
+        self.assertIn(("allowed target", "tcp", "140.82.112.1", 443, "passed"), named)
+        nothing = self.expected(self.targets("research/off", conf))
+        self.assertNotIn("allowed target", nothing)
+        self.assertEqual(nothing["DNS"], {"blocked"})
+
+    def test_the_counter_decides(self):
+        self.assertEqual(fw.probe_verdict("refused", 1), "blocked")
+        self.assertEqual(fw.probe_verdict("timeout", 1), "blocked")
+        self.assertEqual(fw.probe_verdict("refused", 0), "passed")  # the target itself said no
+        self.assertEqual(fw.probe_verdict("timeout", 0), "passed")  # the target is down
+        self.assertEqual(fw.probe_verdict("open", 3), "passed")     # other traffic on the bridge was refused
+
+    def test_only_the_matching_reject_rules_count(self):
+        chain = {"nftables": [{"chain": {"name": "x"}},
+                              {"rule": {"expr": [{"match": {}}, {"counter": {"packets": 2}}, {"reject": {"type": "tcp reset"}}]}},
+                              {"rule": {"expr": [{"counter": {"packets": 50}}, {"reject": {"type": "icmpx", "expr": "admin-prohibited"}}]}},
+                              {"rule": {"expr": [{"counter": {"packets": 7}}, {"return": None}]}}]}
+        with patch.object(fw, "run", return_value=result(json.dumps(chain))) as run:
+            self.assertEqual(fw.reject_count("t", "outbound", "tcp"), 2)
+            self.assertEqual(fw.reject_count("t", "outbound", "udp"), 50)
+        self.assertEqual(run.call_args.args[:6], ("nft", "--json", "list", "chain", "inet", "t"))
+
+    def proved(self, verdicts, wanted):
+        endpoint = unittest.mock.MagicMock()
+        endpoint.__enter__.return_value.attempt.side_effect = verdicts
+        with patch.object(fw, "proof_targets", return_value=wanted), patch.object(fw, "ProofEndpoint", return_value=endpoint):
+            return fw.prove("research", {}, CONF), endpoint.__enter__.return_value.attempt.call_args_list
+
+    WANTED = [("Internet", "tcp", "1.1.1.1", 443, "blocked"), ("Internet", "tcp", "9.9.9.9", 443, "blocked"),
+              ("host", "tcp", "172.18.0.1", 22, "blocked"), ("DNS", "udp", "192.168.0.5", 53, "passed")]
+
+    def test_a_firewall_that_holds(self):
+        (line, held), calls = self.proved([("refused", 1), ("refused", 1), ("refused", 1), ("open", 0)], self.WANTED)
+        self.assertEqual((line, held), ("proof: Internet blocked, host blocked, DNS passed", True))
+        self.assertEqual(calls[0].args, ("outbound", "tcp", "1.1.1.1", 443))
+        self.assertEqual(calls[2].args, ("host_input_guard", "tcp", "172.18.0.1", 22))
+
+    def test_a_firewall_that_does_not_hold_is_named(self):
+        (line, held), _ = self.proved([("open", 0), ("refused", 1), ("refused", 1), ("refused", 1)], self.WANTED)
+        self.assertFalse(held)
+        self.assertEqual(line, "PROOF FAILED: Internet 1.1.1.1 port 443 should be blocked, was passed; "
+                               "DNS 192.168.0.5 port 53 should be passed, was blocked")
+
+    def test_what_cannot_be_tested_says_so(self):
+        with patch.object(fw, "proof_targets", side_effect=fw.FirewallError("Missing command: nsenter\nmore")):
+            self.assertEqual(fw.prove("research", {}, CONF), ("proof: not tested (Missing command: nsenter)", True))
+
+    def test_the_endpoint_disappears_when_it_cannot_be_set_up(self):
+        process = unittest.mock.MagicMock()
+        calls = []
+        def run(*arguments, **kwargs):
+            calls.append(arguments)
+            if arguments[:3] == ("ip", "link", "add"):
+                raise fw.FirewallError("no bridge")
+            return result()
+        with patch.object(fw, "run", side_effect=run), patch.object(fw.subprocess, "Popen", return_value=process), \
+             patch.object(fw.os, "readlink", side_effect=["a", "b"]), self.assertRaisesRegex(fw.FirewallError, "no bridge"):
+            with fw.ProofEndpoint("research"):
+                self.fail("not reached")
+        process.kill.assert_called_once()
+        self.assertEqual(calls[-1][:3], ("ip", "link", "del"))
+
+    def test_only_the_admin_can_ask_for_it(self):
+        self.assertEqual(fw.parse(["status", "--proof"]), (["status"], {"--proof": True}))
+        for argv in (["open", "research", "--proof"], ["close", "research", "--proof"]):
+            with self.subTest(argv=argv), self.assertRaises(fw.FirewallError):
+                fw.parse(argv)
+        # sudoers allows "status P" exactly, with no arguments after it.
+        self.assertNotIn("status research *", fw.sudoers_text(registry("research")))
+
+
 class StatusPartsTests(unittest.TestCase):
     def setUp(self):
         for name, value in (("replaceable_by_others", []), ("health", None), ("networks", {"hermes-fw-research", "hermes-mcp-research-github"}),
@@ -1307,6 +1432,34 @@ class StatusPartsTests(unittest.TestCase):
         self.assertTrue(any(l.startswith("  research/github:") for l in lines))
         self.assertFalse(any("work/x" in l for l in lines))
         self.assertFalse(any("Always reachable" in l for l in lines))
+
+    def proof_lines(self, data, line, held):
+        with patch.object(fw, "prove", return_value=(line, held)) as prove, patch.object(fw, "mcp_warnings", return_value=[]), \
+             patch.object(fw.pwd, "getpwnam", return_value=USER), patch("builtins.print") as output:
+            error = None
+            try:
+                fw.status(data, proof=True)
+            except fw.FirewallError as caught:
+                error = caught
+        return "\n".join(str(c.args[0]) for c in output.call_args_list), prove, error
+
+    def test_proof_comes_under_each_firewall_in_its_part(self):
+        output, prove, error = self.proof_lines(self.data, "proof: Internet blocked", True)
+        self.assertIsNone(error)
+        self.assertEqual([c.args[0] for c in prove.call_args_list], ["research", "research/github"])
+        self.assertIn("LAN closed\n    proof: Internet blocked", output)
+        self.assertIn("api.github.com tcp 443; 140.82.112.0/20 tcp 443\n    proof: Internet blocked", output)
+
+    def test_a_failed_proof_makes_the_command_fail(self):
+        output, _, error = self.proof_lines(self.data, "PROOF FAILED: x", False)
+        self.assertIn("PROOF FAILED: x", output)
+        self.assertRegex(str(error), "research, research/github")
+
+    def test_status_alone_never_tests(self):
+        with patch.object(fw, "prove") as prove, patch.object(fw, "mcp_warnings", return_value=[]), \
+             patch.object(fw.pwd, "getpwnam", return_value=USER), patch("builtins.print"):
+            fw.status(self.data)
+        prove.assert_not_called()
 
     def test_the_plugin_still_reads_the_lease_line(self):
         lines = "\n".join(self.lines(self.data, selected="research"))

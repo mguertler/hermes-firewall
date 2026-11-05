@@ -142,6 +142,21 @@ Index of `hermes_firewall.py` (in file order) and the plugin. Keep it in sync wh
 | `mcp_save_allow(profile, server, allow)` | Add the table to `config.toml` after checking that the new file loads. |
 | `mcp_scan(profile, user)` / `mcp_add(data, profile, server, user, allow)` / `mcp_remove(data, profile, server)` | The `mcp` commands. |
 
+## status --proof
+
+| Function | Job |
+|---|---|
+| `reject_count(table, chain, kind)` | Packets of this kind one chain has refused so far. |
+| `probe_verdict(answer, refused)` | Blocked or passed, decided by the counter. |
+| `in_networks(address, networks)` / `net_list(items)` | Address in networks? / Networks from set elements and config entries. |
+| `public_target(version, avoid)` | A public address no allow list opens. |
+| `host_addresses()` | The host's own addresses outside Docker. |
+| `lan_targets(elements, ipv6, avoid, local)` | One LAN address per family, not the host itself. |
+| `proof_targets(name, record, conf)` | What to try and what the current state should do with it. |
+| `network_config(name)` | Subnets, gateways and addresses in use of the Docker network. |
+| `ProofEndpoint(name)` | Temporary network namespace on the bridge; `attempt(chain, kind, address, port)` tries one connection. |
+| `prove(name, record, conf)` | The test of one firewall -> line for the user, did it hold? |
+
 ## Commands
 
 | Function | Job |
@@ -153,7 +168,7 @@ Index of `hermes_firewall.py` (in file order) and the plugin. Keep it in sync wh
 | `add_profile(data, profile, user, yes)` | `add`. |
 | `remove_profile(data, profile)` | `remove`. |
 | `open_lease(...)` / `close_lease(...)` | `open` / `close`. |
-| `status(data, user, selected, verbose)` | `status`. |
+| `status(data, user, selected, verbose, proof)` | `status`, in two parts; with `proof` it tests each firewall. |
 | `refresh(data)` | Timer job. |
 
 ## Installation

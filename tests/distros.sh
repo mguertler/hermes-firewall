@@ -12,7 +12,7 @@ images=("$@")
 check='set -e
 cd /src
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
-for c in python3 nft ip ss runuser visudo; do command -v "$c" >/dev/null || { echo "missing: $c"; exit 1; }; done
+for c in python3 nft ip ss runuser visudo nsenter unshare; do command -v "$c" >/dev/null || { echo "missing: $c"; exit 1; }; done
 python3 -c "import sys; sys.exit(sys.version_info < (3, 11))" || { echo "Python too old: $(python3 -V)"; exit 1; }
 python3 -B -m unittest discover -s tests >/tmp/unit.log 2>&1 || { tail -20 /tmp/unit.log; exit 1; }
 python3 -I -B - <<PY

@@ -132,7 +132,7 @@ ns "$lan" sh -c 'ip link set lo up; for a in 10 5 2; do ip addr add 192.168.0.$a
                  ip link set eth0 up; ip route add default via 192.168.0.1; ip -6 route add default via fd00:1::1'
 # shellcheck disable=SC2016  # $a expands in the inner shell
 ns "$internet" sh -c 'ip link set lo up; ip addr add 93.184.0.10/24 dev eth0; ip addr add 2001:db8:ff::10/64 dev eth0 nodad
-                      for a in 93.184.1.7 9.9.9.9 203.0.113.50 10.0.0.1; do ip addr add $a/32 dev eth0; done
+                      for a in 93.184.1.7 9.9.9.9 1.1.1.1 203.0.113.50 10.0.0.1; do ip addr add $a/32 dev eth0; done
                       for a in 2606:4700::10 2606:4700:4700::1111 64:ff9b::5db8:a 64:ff9b::c0a8:a 64:ff9b::a00:1 \
                                2002:c0a8:a::1; do ip addr add $a/128 dev eth0 nodad; done
                       ip link set eth0 up; ip route add default via 93.184.0.1; ip -6 route add default via 2001:db8:ff::1'
@@ -231,4 +231,62 @@ for state in ips names; do
         printf 'mcp-%-10s ok (%d targets)\n' "$state" "${#expected_list[@]}"
     fi
 done
+
+# status --proof with a real test endpoint on the bridge and real counters. Only Docker's answer is faked.
+"$NFT" -f "$work/rules.nft"
+sleep 2  # ICMP allowance, see above
+python3 -I -B - "$here/../hermes_firewall.py" "$work" "$NFT" "$subnet6" <<'PY' || failed=1
+import importlib.util, json, subprocess, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("fw", sys.argv[1])
+fw = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fw)
+out, nft, subnet6 = Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+fw.CACHE, fw.trusted = out / "resolved.json", lambda path: None
+fw.resolve_host = lambda host, servers: ["93.184.1.7"]
+real_run, real_identity = fw.run, fw.identity
+fw.identity = lambda name: real_identity(name.split("/")[0])  # all share the one bridge of this test
+def run(*arguments, **kwargs):
+    if arguments[0] == "nft":
+        return subprocess.run([nft, *arguments[1:]], input=kwargs.get("input"), capture_output=True, text=True, check=True)
+    if arguments[0] == "docker":
+        return subprocess.CompletedProcess(arguments, 0, json.dumps([{"IPAM": {"Config": [
+            {"Subnet": "172.30.0.0/24", "Gateway": "172.30.0.1"}, {"Subnet": subnet6 + "::/64", "Gateway": subnet6 + "::1"}]},
+            "Containers": {"x": {"IPv4Address": "172.30.0.2/24", "IPv6Address": subnet6 + "::2/64"}}}]), "")
+    if arguments[0] == "nsenter":
+        arguments = ("nsenter", "--preserve-credentials", *arguments[1:])
+    return real_run(*arguments, **kwargs)
+fw.run = run
+conf = {"dns": ["192.168.0.5"], "allow": [{"net": "192.168.0.2/32", "tcp": [8088], "udp": []}],
+        "lan_networks": ["192.168.0.0/24", "fd00:1::/64"],
+        "mcp": {"netns-test/ips": [{"net": "203.0.113.50/32", "tcp": [80], "udp": []}],
+                "netns-test/names": [{"host": "lanhost.test", "tcp": [80], "udp": []}]}}
+record = {"user": "x", "ipv6": True}
+wrong = 0
+def check(state, name, *expected):
+    global wrong
+    line, held = fw.prove(name, record, conf)
+    good = all(text in line for text in expected) and held == ("PROOF FAILED" not in expected[0])
+    print(f"proof {state:13} {'ok' if good else 'FAIL: ' + line}")
+    wrong += not good
+def load(path):
+    subprocess.run([nft, "-f", str(out / path)], check=True)
+    time.sleep(2)  # ICMP allowance
+check("closed", "netns-test", "Internet blocked", "LAN blocked", "host blocked", "DNS passed")
+for state, internet, lan in (("open-internet", "passed", "blocked"), ("open-lan", "blocked", "passed"), ("open-all", "passed", "passed")):
+    load(f"{state}.nft")
+    check(state, "netns-test", f"Internet {internet}", f"LAN {lan}", "host blocked", "DNS passed")
+load("mcp-ips.nft")
+check("mcp-ips", "netns-test/ips", "allowed target passed", "other port blocked", "Internet blocked", "LAN blocked", "host blocked", "DNS blocked")
+load("mcp-names.nft")
+check("mcp-names", "netns-test/names", "allowed target passed", "other port blocked", "Internet blocked", "LAN blocked", "DNS passed")
+# A firewall that does not hold must be noticed: here an address nobody allowed. Health checks do not see this.
+load("rules.nft")
+table = real_identity("netns-test")["table"]
+subprocess.run([nft, "add", "element", "inet", table, "allow_v4", "{", "1.1.1.1", "}"], check=True)
+check("broken", "netns-test", "PROOF FAILED", "Internet 1.1.1.1")
+left = subprocess.run(["ip", "-o", "link", "show"], capture_output=True, text=True).stdout
+print(f"proof {'clean up':13} {'FAIL' if 'hfwp' in left else 'ok'}")
+sys.exit(1 if wrong or "hfwp" in left else 0)
+PY
 exit "$failed"
