@@ -70,7 +70,7 @@ hermes -p default config set plugins.entries.hermes-firewall.settings.agent_noti
 sudo hermes-firewall add PROFILE                    protect a profile (everything closed)
 sudo hermes-firewall open PROFILE [for] [internet|lan|all] [DURATION]
 sudo hermes-firewall close PROFILE [internet|lan|all]
-sudo hermes-firewall status [PROFILE]
+sudo hermes-firewall status [PROFILE]               two parts: sandbox firewalls, MCP container firewalls
 sudo hermes-firewall remove PROFILE                 remove the firewall; the sandbox then has no network
 ```
 
@@ -97,11 +97,26 @@ The sandbox firewall does not cover MCP servers: Hermes starts them on the host,
 
 ```text
 sudo hermes-firewall mcp scan PROFILE               what the profile's MCP servers can reach
-sudo hermes-firewall mcp add PROFILE SERVER         lock a server to its allow list
+sudo hermes-firewall mcp add PROFILE SERVER         lock a server to an allow list (asks for it if there is none)
 sudo hermes-firewall mcp remove PROFILE SERVER      remove its firewall; the server then has no network
 ```
 
-The allow list is in the root-owned `/etc/hermes-firewall/config.toml`, not in the Hermes configuration, and every target names its ports:
+If a server has no allow list yet, `mcp add` asks on the terminal:
+
+```text
+$ sudo hermes-firewall mcp add default github
+MCP server github has no allow list yet. Without one, its container reaches nothing.
+Your answers are saved in /etc/hermes-firewall/config.toml. You can also edit that file yourself at any time,
+then run: sudo hermes-firewall refresh
+
+Do you want to allow certain hosts or networks for this MCP server? [y/N] y
+Host name, IP address or network (empty = done): api.github.com
+  TCP ports, separated by commas [443]:
+  UDP ports, separated by commas [none]:
+Host name, IP address or network (empty = done):
+```
+
+The list is in the root-owned `/etc/hermes-firewall/config.toml`, not in the Hermes configuration. The answers are added at the end of the file, and the rest of it stays as it is. Every target names its ports. To set it up by hand, or without a terminal, write it yourself before `mcp add`:
 
 ```toml
 [[mcp]]
@@ -115,7 +130,7 @@ server = "filesystem"
 allow = []                      # reaches nothing at all
 ```
 
-`mcp add` creates the network and puts `--network=hermes-mcp-PROFILE-SERVER` and `--dns=...` right after `run` in the server's `args`; everything else stays as it is. It applies when the server starts again: `/reload-mcp` in the chat, or restart the gateway. Changes to an allow list reach the firewall within 5 minutes (or with `sudo hermes-firewall refresh`).
+`mcp add` then creates the network and puts `--network=hermes-mcp-PROFILE-SERVER` and `--dns=...` right after `run` in the server's `args`; everything else stays as it is. It applies when the server starts again: `/reload-mcp` in the chat, or restart the gateway. Changes to an allow list reach the firewall within 5 minutes (or with `sudo hermes-firewall refresh`).
 
 What `mcp scan` finds and what happens to it:
 

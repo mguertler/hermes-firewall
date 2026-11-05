@@ -61,7 +61,7 @@ Not covered automatically; record the result (distribution, versions, date) belo
 6. Hermes egress proxy (`hermes egress setup/start`, `proxy.enforce_on_docker false`): reachable from the sandbox in every state, other host ports and its management port not.
 7. `sudo ./install.sh` again (upgrade) keeps leases open; `uninstall.sh` and `--purge`.
 8. What the agent is told, in a real Hermes session: `/context` or `HERMES_DUMP_REQUESTS=true` shows the rule once in the system prompt with `prompt_rule` on and not with it off; with `status_line` on, every user message carries the current state, also after `/firewall open` and after a lease ran out.
-9. MCP firewall, with a small MCP server in `docker run -i`: `mcp scan` names all kinds of servers; `mcp add` writes only the own entries after `run` and keeps `${VAR}` in `config.yaml`; only the listed targets and ports work, for addresses and names; a list of only addresses gets no DNS; `hermes mcp test SERVER` starts it; after a reboot it works the same; `mcp remove` leaves `--network=none`; `remove PROFILE` and `uninstall` refuse while it exists.
+9. MCP firewall, with a small MCP server in `docker run -i`: `mcp scan` names all kinds of servers; `mcp add` asks for a missing allow list on a terminal and adds it to `config.toml`; it writes only the own entries after `run` and keeps `${VAR}` in `config.yaml`; only the listed targets and ports work, for addresses and names; a list of only addresses gets no DNS; `hermes mcp test SERVER` starts it; after a reboot it works the same; `mcp remove` leaves `--network=none`; `remove PROFILE` and `uninstall` refuse while it exists.
 10. Distributions: Debian 13, Ubuntu 24.04, Fedora, Arch, openSUSE (install, add, open, close).
 
 ## Results
@@ -89,5 +89,7 @@ Not covered automatically; record the result (distribution, versions, date) belo
 | 2026-11-05 | manual 9 (scan of all kinds, add/remove, `${VAR}` kept, IPv4 + IPv6 targets and ports, names, DNS only for names, `hermes mcp test`, restored by refresh, fail closed without network, after a reboot, `--network=none` after remove) | test VM | pass |
 | 2026-11-05 | tests/distros.sh, now with the rules of an MCP firewall | Debian 12 (nft 1.0.6) and 13, Ubuntu 24.04, Fedora 42, Arch, openSUSE Tumbleweed | pass |
 | 2026-11-05 | manual 7 again (upgrade keeps tables; uninstall removes `/run/hermes-firewall`; reinstall) | test VM | pass |
+| 2026-11-05 | status in two parts; `mcp add` asks for the allow list and saves it: unit tests | local | pass |
+| | live: the dialog of `mcp add` on a real terminal, `status` with MCP firewalls | | **not done yet** |
 | | a model calling a firewalled MCP tool (qwen3:8b did not manage Hermes' deferred tools; `hermes mcp test` connects and lists them) | | **not done** |
 | | a full provider request through iron-proxy (needs a real API key); manual 10 live on other distributions (containers: pass) | | **not done** |

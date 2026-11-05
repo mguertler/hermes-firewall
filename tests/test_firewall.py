@@ -525,9 +525,10 @@ class ProfileTests(unittest.TestCase):
              patch.object(fw, "lease_remaining", side_effect=[2472, None]), patch("builtins.print") as output:
             fw.status(data, USER)
         lines = [c.args[0] for c in output.call_args_list]
-        self.assertRegex(lines[0], r"^research: firewall active, Internet open for 41m \(until \d\d:\d\d\), LAN closed$")
-        self.assertEqual(lines[1], "work: NOT protected (to protect it: sudo hermes-firewall add work)")
-        self.assertEqual(lines[2], "Always reachable from protected sandboxes: DNS 192.168.0.5; "
+        self.assertTrue(lines[0].startswith("Sandbox firewall"))
+        self.assertRegex(lines[1], r"^  research: firewall active, Internet open for 41m \(until \d\d:\d\d\), LAN closed$")
+        self.assertEqual(lines[2], "  work: NOT protected (to protect it: sudo hermes-firewall add work)")
+        self.assertEqual(lines[3], "  Always reachable from protected sandboxes: DNS 192.168.0.5; "
                                    "192.168.0.2/32 tcp 8088; Hermes egress proxy")
 
     def test_status_reports_broken_firewall(self):
@@ -1139,6 +1140,179 @@ class McpHermesSideTests(unittest.TestCase):
                     fw.user_command(words)
 
 
+class McpAllowDialogTests(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.home.cleanup)
+        self.user = pwd.struct_passwd(("hermes", "x", 1000, 1000, "", self.home.name, "/bin/bash"))
+
+    def ask(self, answers, tty=True, state="ready"):
+        with patch.object(fw, "load_config", return_value={**MCP_CONF, "mcp": {}}), patch.object(fw.sys.stdin, "isatty", return_value=tty), \
+             patch.object(fw, "mcp_check", return_value=state) as check, patch("builtins.input", side_effect=answers) as asked, \
+             patch("builtins.print") as output:
+            allow = fw.mcp_ask_allow("research", "github", self.user)
+        return allow, check, asked, "\n".join(str(c.args[0]) for c in output.call_args_list if c.args)
+
+    def test_it_says_where_the_list_goes_and_how_to_change_it_yourself(self):
+        _, _, asked, output = self.ask(["n"])
+        self.assertIn(str(fw.CONFIG), output)
+        self.assertIn("edit that file yourself", output)
+        self.assertIn("sudo hermes-firewall refresh", output)
+        self.assertIn("Do you want to allow certain hosts or networks for this MCP server?", asked.call_args_list[0].args[0])
+
+    def test_no_means_it_reaches_nothing(self):
+        for answers in (["n"], [""], ["y", ""]):
+            with self.subTest(answers=answers):
+                self.assertEqual(self.ask(answers)[0], [])
+
+    def test_hosts_addresses_and_networks_with_their_ports(self):
+        allow, _, _, _ = self.ask(["y", "api.github.com", "", "", "140.82.112.3", "80, 443", "53", "2001:db8::/32", "443", "none", ""])
+        self.assertEqual(allow, [{"host": "api.github.com", "tcp": [443], "udp": []},
+                                 {"net": "140.82.112.3/32", "tcp": [80, 443], "udp": [53]},
+                                 {"net": "2001:db8::/32", "tcp": [443], "udp": []}])
+
+    def test_wrong_answers_are_asked_again(self):
+        allow, _, _, output = self.ask(["y", "a b", "1.2.3.4/33", "999.1.1.1", "0.0.0.0/0", "x.org", "0", "abc", "70000", "443", "", ""])
+        self.assertEqual(allow, [{"host": "x.org", "tcp": [443], "udp": []}])
+        self.assertIn("Not a host name", output)
+        self.assertIn("whole address family", output)
+        self.assertIn("Port numbers", output)
+
+    def test_a_target_without_any_port_is_not_accepted(self):
+        allow, _, _, output = self.ask(["y", "x.org", "none", "none", "8443", "", ""])
+        self.assertEqual(allow, [{"host": "x.org", "tcp": [8443], "udp": []}])
+        self.assertIn("at least one port", output)
+
+    def test_no_questions_without_a_terminal_or_with_a_list(self):
+        allow, check, asked, _ = self.ask([], tty=False)
+        self.assertIsNone(allow)
+        check.assert_not_called()
+        asked.assert_not_called()
+        with patch.object(fw, "load_config", return_value=MCP_CONF), patch.object(fw.sys.stdin, "isatty", return_value=True), \
+             patch("builtins.input") as asked:
+            self.assertIsNone(fw.mcp_ask_allow("research", "github", self.user))
+        asked.assert_not_called()
+
+    def test_what_cannot_be_protected_is_refused_before_any_question(self):
+        with patch.object(fw, "load_config", return_value={**MCP_CONF, "mcp": {}}), patch.object(fw.sys.stdin, "isatty", return_value=True), \
+             patch.object(fw, "mcp_check", side_effect=fw.FirewallError("runs on the host")), patch("builtins.input") as asked, \
+             self.assertRaisesRegex(fw.FirewallError, "runs on the host"):
+            fw.mcp_ask_allow("research", "github", self.user)
+        asked.assert_not_called()
+
+    def test_stopping_changes_nothing(self):
+        for stop in (EOFError(), KeyboardInterrupt()):
+            with self.subTest(stop=stop), self.assertRaisesRegex(fw.FirewallError, "nothing was changed"):
+                self.ask(["y", stop])
+
+    def saved(self, allow, text='# my comment\n[sandbox]\ndns = ["192.168.0.5"]   # keep\n'):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.toml"
+            config.write_text(text)
+            with patch.object(fw, "CONF", Path(directory)), patch.object(fw, "CONFIG", config), patch.object(fw, "trusted"), \
+                 patch("builtins.print") as output:
+                conf = fw.mcp_save_allow("research", "github", allow)
+            self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), ["config.toml"])
+            return conf, config.read_text(), "\n".join(str(c.args[0]) for c in output.call_args_list)
+
+    def test_saved_list_is_valid_and_the_rest_of_the_file_stays(self):
+        allow = [{"host": "api.github.com", "tcp": [443], "udp": []}, {"net": "2001:db8::/32", "tcp": [], "udp": [53, 443]}]
+        conf, text, output = self.saved(allow)
+        self.assertEqual(conf["mcp"]["research/github"], allow)
+        self.assertTrue(text.startswith('# my comment\n[sandbox]\ndns = ["192.168.0.5"]   # keep\n\n[[mcp]]\n'))
+        self.assertIn('allow = [{ host = "api.github.com", tcp = [443] }, { net = "2001:db8::/32", udp = [53, 443] }]', text)
+        self.assertIn("Saved in", output)
+        self.assertIn("DNS servers", output)
+        self.assertEqual(self.saved([])[0]["mcp"]["research/github"], [])
+        self.assertIn("allow = []", self.saved([])[1])
+
+    def test_a_broken_config_file_is_not_replaced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.toml"
+            config.write_text("broken = \n")
+            with patch.object(fw, "CONF", Path(directory)), patch.object(fw, "CONFIG", config), patch.object(fw, "trusted"), \
+                 self.assertRaises(fw.FirewallError):
+                fw.mcp_save_allow("research", "github", [])
+            self.assertEqual(config.read_text(), "broken = \n")
+            self.assertEqual([p.name for p in Path(directory).iterdir()], ["config.toml"])
+
+    def test_add_saves_the_answers_and_uses_them(self):
+        new = {**MCP_CONF, "mcp": {"research/github": [{"host": "x.org", "tcp": [443], "udp": []}]}}
+        answers = [{"host": "x.org", "tcp": [443], "udp": []}]
+        data = registry()
+        (Path(self.home.name) / ".hermes").mkdir()
+        with patch.object(fw, "load_config", return_value={**MCP_CONF, "mcp": {}}), patch.object(fw, "mcp_check", return_value="ready"), \
+             patch.object(fw, "mcp_save_allow", return_value=new) as save, patch.object(fw, "as_user", return_value=""), \
+             patch.object(fw, "docker_ready"), patch.object(fw, "free_subnet", return_value="172.31.240.0/28"), \
+             patch.object(fw, "ipv6_enabled", return_value=False), patch.object(fw, "save_registry"), \
+             patch.object(fw, "create_firewall", side_effect=lambda d, k, r, c: d.setdefault("mcp", {}).__setitem__(k, r)) as create, \
+             patch("builtins.print") as output:
+            fw.mcp_add(data, "research", "github", self.user, answers)
+        save.assert_called_once_with("research", "github", answers)
+        self.assertEqual(create.call_args.args[3], new)
+        self.assertIn("x.org tcp 443", "\n".join(str(c.args[0]) for c in output.call_args_list))
+
+    def test_questions_come_before_the_lock(self):
+        order = []
+        lock = os.stat_result((0o100600, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        with tempfile.TemporaryDirectory() as directory, patch.object(fw, "LOCK", Path(directory) / "lock"), \
+             patch.object(fw.os, "geteuid", return_value=0), patch.object(fw.os, "fstat", return_value=lock), \
+             patch.object(fw, "hermes_user", return_value=self.user), patch.object(fw, "load_registry", side_effect=lambda: order.append("locked") or registry()), \
+             patch.object(fw, "mcp_ask_allow", side_effect=lambda *a: order.append("asked") or []), \
+             patch.object(fw, "mcp_add", side_effect=lambda *a: order.append(a[-1])):
+            fw.main(["mcp", "add", "research", "github"])
+        self.assertEqual(order, ["asked", "locked", []])
+
+
+class StatusPartsTests(unittest.TestCase):
+    def setUp(self):
+        for name, value in (("replaceable_by_others", []), ("health", None), ("networks", {"hermes-fw-research", "hermes-mcp-research-github"}),
+                            ("check_network", None), ("protect_sandboxes", []), ("load_config", MCP_CONF),
+                            ("profile_line", "research: firewall active, Internet closed, LAN closed")):
+            item = patch.object(fw, name, return_value=value)
+            item.start()
+            self.addCleanup(item.stop)
+        self.data = {**registry("research"), "mcp": {"research/github": {"user": "hermes", "ipv6": False, "subnet": "172.31.240.0/28", "dns": []}}}
+
+    def lines(self, data, selected=None, warnings=()):
+        with patch.object(fw, "mcp_warnings", return_value=list(warnings)), patch.object(fw.pwd, "getpwnam", return_value=USER), \
+             patch("builtins.print") as output:
+            fw.status(data, selected=selected)
+        return "\n".join(str(c.args[0]) for c in output.call_args_list).split("\n")
+
+    def test_sandboxes_and_mcp_containers_are_two_parts(self):
+        lines = self.lines(self.data, warnings=["research: WARNING - MCP server other runs in Docker WITHOUT a firewall."])
+        blank = lines.index("")
+        sandbox, mcp = lines[:blank], lines[blank + 1:]
+        self.assertTrue(sandbox[0].startswith("Sandbox firewall"))
+        self.assertEqual(sandbox[1], "  research: firewall active, Internet closed, LAN closed")
+        self.assertIn("Always reachable", sandbox[2])
+        self.assertTrue(mcp[0].startswith("MCP container firewall"))
+        self.assertTrue(mcp[1].startswith("  research/github: firewall active, can reach only: api.github.com tcp 443"))
+        self.assertIn("WARNING - MCP server other", mcp[2])
+        self.assertEqual(len(sandbox) + len(mcp) + 1, len(lines))
+
+    def test_the_mcp_part_also_says_when_there_is_nothing(self):
+        lines = self.lines(registry("research"))
+        self.assertTrue(lines[lines.index("") + 1].startswith("MCP container firewall"))
+        self.assertTrue(lines[-1].startswith("  none"))
+
+    def test_status_of_one_profile_stays_one_line_without_mcp_firewalls(self):
+        self.assertEqual(self.lines(registry("research"), selected="research"), ["research: firewall active, Internet closed, LAN closed"])
+
+    def test_status_of_one_profile_shows_only_its_own_mcp_firewalls(self):
+        other = {"user": "hermes", "ipv6": False, "subnet": "172.31.240.16/28", "dns": []}
+        data = {**self.data, "mcp": {**self.data["mcp"], "work/x": other}}
+        lines = self.lines(data, selected="research")
+        self.assertTrue(any(l.startswith("  research/github:") for l in lines))
+        self.assertFalse(any("work/x" in l for l in lines))
+        self.assertFalse(any("Always reachable" in l for l in lines))
+
+    def test_the_plugin_still_reads_the_lease_line(self):
+        lines = "\n".join(self.lines(self.data, selected="research"))
+        self.assertRegex(lines, r"(?m)firewall active, Internet (.+?), LAN (.+)$")
+
+
 class McpCommandTests(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.TemporaryDirectory()
@@ -1181,9 +1355,9 @@ class McpCommandTests(unittest.TestCase):
         create.assert_not_called()
         network.assert_called_once()
 
-    def test_add_needs_an_allow_list_in_the_root_owned_config(self):
+    def test_without_a_terminal_add_explains_how_to_write_the_allow_list(self):
         conf = {**MCP_CONF, "mcp": {}}
-        with self.assertRaisesRegex(fw.FirewallError, r"\[\[mcp\]\]"):
+        with self.assertRaisesRegex(fw.FirewallError, r"(?s)\[\[mcp\]\]\nprofile = \"research\".*allow = \[\{ host"):
             self.mcp_add(registry(), conf=conf)
 
     def test_add_refuses_what_it_cannot_protect(self):

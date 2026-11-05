@@ -135,7 +135,12 @@ Index of `hermes_firewall.py` (in file order) and the plugin. Keep it in sync wh
 | `mcp_warnings(profile, user)` | One line per Docker MCP server without a firewall. |
 | `mcp_owners(data)` | `{profile: user}` of everything that can have MCP servers to check. |
 | `allowed_text(conf, key)` | What an MCP server can reach, for the user. |
-| `mcp_scan(profile, user)` / `mcp_add(data, profile, server, user)` / `mcp_remove(data, profile, server)` | The `mcp` commands. |
+| `mcp_check(profile, server, user)` | Can this server get a firewall? Its state, or an error that says why. |
+| `mcp_block(profile, server, allow)` | The `[[mcp]]` table of a server as text. |
+| `ask_target()` / `ask_ports(proto, default)` | One allow-list target / its ports from the user. |
+| `mcp_ask_allow(profile, server, user)` | Ask for the allow list of a server that has none; before the global lock. |
+| `mcp_save_allow(profile, server, allow)` | Add the table to `config.toml` after checking that the new file loads. |
+| `mcp_scan(profile, user)` / `mcp_add(data, profile, server, user, allow)` / `mcp_remove(data, profile, server)` | The `mcp` commands. |
 
 ## Commands
 
