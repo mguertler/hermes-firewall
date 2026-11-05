@@ -43,6 +43,7 @@ STATE = Path("/run/hermes-firewall")
 KINDS = ("internet", "lan")
 LABEL = "hermes-firewall.profile"
 PROFILE_RE = r"[a-z0-9][a-z0-9_-]{0,63}"  # Hermes' own profile id rule
+SERVER_RE = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"  # MCP server names the Hermes CLI can address (no dots)
 MAX_LEASE = 86400
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C", "HOME": "/root",
        "DOCKER_HOST": "unix:///var/run/docker.sock"}
@@ -56,6 +57,15 @@ NONPUBLIC_V6 = ("::/127", "::ffff:0:0/96", "64:ff9b:1::/48", "100::/64", "2001::
                 "fe80::/10", "fec0::/10", "ff00::/8")
 # NAT64 well-known prefix; prefixes announced by DNS64 (RFC 7050) are added at runtime.
 NAT64_WKP = "64:ff9b::/96"
+# MCP firewalls get a /28 from this range, because Docker's own pools only last for about 30 networks.
+MCP_SUBNET = "172.31.240.0/20"
+# DNS of an MCP container without names in its allow list: a documentation address nothing answers on.
+# Without it, Docker's own resolver could still ask the host's DNS server for the container.
+NO_DNS = "192.0.2.1"
+# A name stays allowed this long after it last resolved to an address (services rotate their addresses).
+MCP_ADDRESS_KEEP = 86400
+# Docker options that let code leave any container, whatever its network.
+ESCAPES = r"--privileged\S*|\S*docker\.sock\S*|--pid[= ]host|--userns[= ]host|--cap-add[= ](?:ALL|SYS_ADMIN)"
 # Interfaces whose networks never count as LAN for lan.networks = ["auto"].
 VIRTUAL_INTERFACES = ("lo", "docker", "br-", "hfw", "veth", "virbr")
 
@@ -116,11 +126,13 @@ def require(condition, message):
         raise FirewallError(message)
 
 
-def identity(profile):
-    require(isinstance(profile, str) and re.fullmatch(PROFILE_RE, profile),
-            f"Not a Hermes profile name: {profile!r} (lowercase letters, digits, '_' and '-').")
-    digest = hashlib.sha256(profile.encode("ascii")).hexdigest()
-    return {"bridge": "hfw" + digest[:12], "network": "hermes-fw-" + profile,
+def identity(name):
+    """The names of a firewall: of a profile, or of an MCP server ("PROFILE/SERVER")."""
+    require(isinstance(name, str) and re.fullmatch(f"{PROFILE_RE}(/{SERVER_RE})?", name),
+            f"Not a Hermes profile name: {name!r} (lowercase letters, digits, '_' and '-').")
+    digest = hashlib.sha256(name.encode("ascii")).hexdigest()
+    return {"bridge": "hfw" + digest[:12],
+            "network": "hermes-mcp-" + name.replace("/", "-") if "/" in name else "hermes-fw-" + name,
             "table": "hermes_fw_" + digest[:12],
             "subnet6": f"fd{digest[12:14]}:{digest[14:18]}:{digest[18:22]}::/64"}
 
@@ -192,8 +204,8 @@ def load_config(path=None):
             data = tomllib.load(handle)
     except tomllib.TOMLDecodeError as error:
         raise FirewallError(f"{path}: {error}") from None
-    known = {"ipv6": None, "docker_requires_firewall": None, "lease": {"default", "max"},
-             "sandbox": {"dns"}, "lan": {"networks", "hosts"}, "hermes": {"egress_proxy"}, "allow": None}
+    known = {"ipv6": None, "docker_requires_firewall": None, "mcp_subnet": None, "lease": {"default", "max"},
+             "sandbox": {"dns"}, "lan": {"networks", "hosts"}, "hermes": {"egress_proxy"}, "allow": None, "mcp": None}
     for key, value in data.items():
         require(key in known, f"Unknown setting in {path}: {key}")
         if known[key]:
@@ -238,7 +250,53 @@ def load_config(path=None):
             raise FirewallError(f"Not an address or network in {path}: allow {entry['net']!r}") from None
         require(network.prefixlen > 0, "allow: a whole address family would disable the firewall.")
         conf["allow"].append({"net": str(network), "tcp": ports(entry, "tcp"), "udp": ports(entry, "udp")})
+    conf["mcp_subnet"] = mcp_subnet(data.get("mcp_subnet", MCP_SUBNET))
+    conf["mcp"] = mcp_servers_config(data.get("mcp", []), path)
     return conf
+
+
+def mcp_subnet(text):
+    try:
+        network = ipaddress.ip_network(text)
+    except (ValueError, TypeError):
+        raise FirewallError(f"mcp_subnet is not a network: {text!r}") from None
+    require(network.version == 4 and network.is_private and network.prefixlen <= 28,
+            "mcp_subnet must be a private IPv4 network of /28 or larger.")
+    return str(network)
+
+
+def mcp_servers_config(entries, path):
+    """[[mcp]] tables -> {"PROFILE/SERVER": allow list}. Every allowed target names its ports."""
+    require(type(entries) is list, "Use [[mcp]] tables for the MCP servers.")
+    servers = {}
+    for entry in entries:
+        require(type(entry) is dict and set(entry) <= {"profile", "server", "allow"} and {"profile", "server"} <= set(entry),
+                f"mcp entries take profile, server and allow: {entry}")
+        key = f"{entry['profile']}/{entry['server']}"
+        identity(key)
+        require(key not in servers, f"Two [[mcp]] entries for {key} in {path}.")
+        allow = entry.get("allow", [])
+        require(type(allow) is list, f"mcp {key}: allow must be a list.")
+        servers[key] = []
+        for target in allow:
+            require(type(target) is dict and set(target) <= {"net", "host", "tcp", "udp"}
+                    and len(set(target) & {"net", "host"}) == 1,
+                    f"mcp {key}: allow entries take net or host, and tcp/udp: {target}")
+            item = {"tcp": ports(target, "tcp"), "udp": ports(target, "udp")}
+            require(item["tcp"] or item["udp"], f"mcp {key}: name the allowed ports (tcp, udp) of {target}.")
+            if "host" in target:
+                require(type(target["host"]) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", target["host"]),
+                        f"mcp {key}: not a host name: {target['host']!r}")
+                item["host"] = target["host"]
+            else:
+                try:
+                    item["net"] = str(ipaddress.ip_network(target["net"]))
+                except (ValueError, TypeError):
+                    raise FirewallError(f"mcp {key}: not an address or network: {target['net']!r}") from None
+                require(ipaddress.ip_network(item["net"]).prefixlen > 0,
+                        f"mcp {key}: a whole address family would disable the firewall.")
+            servers[key].append(item)
+    return servers
 
 
 def detected_dns(files=("/etc/resolv.conf", "/run/systemd/resolve/resolv.conf")):
@@ -455,21 +513,78 @@ def common_sets(conf, strict=False):
         atomic_write(CACHE, json.dumps(cache, indent=2, sort_keys=True) + "\n")
     lan4 = [a for a in lan if family(a) == 4]
     whole = [e["net"] for e in conf["allow"] if not e["tcp"] and not e["udp"]]
-    # Overlapping networks for the same port would make nft refuse the whole table: collapse them.
+    return {"lan_v4": unique(lan4), "lan_v6": unique([a for a in lan if family(a) == 6] + nat64(prefixes, lan4)),
+            "dns_v4": [d for d in conf["dns"] if family(d) == 4], "dns_v6": [d for d in conf["dns"] if family(d) == 6],
+            "allow_v4": [n for n in whole if family(n) == 4], "allow_v6": [n for n in whole if family(n) == 6],
+            **service_sets(conf["allow"]),
+            "non_public_v6": [*NONPUBLIC_V6, *nat64(prefixes, NONPUBLIC_V4)]}
+
+
+def service_sets(allow):
+    """allow_ports_v4/v6 of allow entries with ports. Overlapping networks for the same port would
+    make nft refuse the whole table, so they are collapsed."""
     groups = {}
-    for entry in conf["allow"]:
+    for entry in allow:
         for proto in ("tcp", "udp"):
             for port in entry[proto]:
                 network = ipaddress.ip_network(entry["net"])
                 groups.setdefault((network.version, proto, port), []).append(network)
     services = [f"{network} . {proto} . {port}" for (_, proto, port), items in sorted(groups.items())
                 for network in ipaddress.collapse_addresses(items)]
-    return {"lan_v4": unique(lan4), "lan_v6": unique([a for a in lan if family(a) == 6] + nat64(prefixes, lan4)),
-            "dns_v4": [d for d in conf["dns"] if family(d) == 4], "dns_v6": [d for d in conf["dns"] if family(d) == 6],
-            "allow_v4": [n for n in whole if family(n) == 4], "allow_v6": [n for n in whole if family(n) == 6],
-            "allow_ports_v4": unique(s for s in services if family(s.split()[0]) == 4),
-            "allow_ports_v6": unique(s for s in services if family(s.split()[0]) == 6),
-            "non_public_v6": [*NONPUBLIC_V6, *nat64(prefixes, NONPUBLIC_V4)]}
+    return {"allow_ports_v4": unique(s for s in services if family(s.split()[0]) == 4),
+            "allow_ports_v6": unique(s for s in services if family(s.split()[0]) == 6)}
+
+
+def mcp_dns(conf, key):
+    """DNS servers of an MCP container: only a server with names in its allow list needs real ones."""
+    return conf["dns"] if any("host" in target for target in conf["mcp"].get(key, [])) else [NO_DNS]
+
+
+def mcp_addresses(conf):
+    """{host: [addresses]} of the names in MCP allow lists: all seen recently, because services rotate
+    their addresses and the container may get another answer than the firewall. A failed lookup keeps
+    the known addresses; a name that never resolved allows nothing."""
+    cache = load_cache()
+    old = json.dumps(cache, sort_keys=True)
+    seen, now = cache.setdefault("mcp_hosts", {}), int(time.time())
+    hosts = {target["host"] for allow in conf["mcp"].values() for target in allow if "host" in target}
+    for host in sorted(hosts):
+        try:
+            seen.setdefault(host, {}).update(dict.fromkeys(resolve_host(host, conf["dns"]), now))
+        except OSError as error:
+            print(f"WARNING: cannot resolve MCP allow-list name {host} ({error}); using its known addresses "
+                  f"{sorted(seen.get(host, {})) or '(none)'}.", file=sys.stderr)
+    cache["mcp_hosts"] = {host: fresh for host in sorted(hosts)
+                          if (fresh := {a: when for a, when in seen.get(host, {}).items() if now - when < MCP_ADDRESS_KEEP})}
+    if json.dumps(cache, sort_keys=True) != old:
+        atomic_write(CACHE, json.dumps(cache, indent=2, sort_keys=True) + "\n")
+    return {host: sorted(addresses) for host, addresses in cache["mcp_hosts"].items()}
+
+
+def mcp_sets(conf, key, addresses):
+    """Set elements of an MCP firewall: only its allow list, and DNS only if that list has names."""
+    allow = []
+    for target in conf["mcp"].get(key, []):
+        nets = [target["net"]] if "net" in target else addresses.get(target["host"], [])
+        allow += [{"net": str(ipaddress.ip_network(net)), "tcp": target["tcp"], "udp": target["udp"]} for net in nets]
+    dns = [] if mcp_dns(conf, key) == [NO_DNS] else conf["dns"]
+    return {"dns_v4": [d for d in dns if family(d) == 4], "dns_v6": [d for d in dns if family(d) == 6],
+            **service_sets(allow)}
+
+
+def free_subnet(data, conf):
+    """The first /28 of mcp_subnet that no MCP firewall, Docker network or route of this host uses."""
+    used = [r["subnet"] for r in data.get("mcp", {}).values()]
+    ids = run("docker", "network", "ls", "-q").stdout.split()
+    for network in json.loads(run("docker", "network", "inspect", *ids).stdout) if ids else []:
+        used += [c["Subnet"] for c in (network.get("IPAM") or {}).get("Config") or [] if c.get("Subnet")]
+    used += [r["dst"] for r in json.loads(run("ip", "-j", "-4", "route", "show", "table", "main").stdout or "[]")
+             if r.get("dst", "default") != "default"]
+    taken = [ipaddress.ip_network(u, strict=False) for u in used if family(u) == 4]
+    for candidate in ipaddress.ip_network(conf["mcp_subnet"]).subnets(new_prefix=28):
+        if not any(candidate.overlaps(u) for u in taken):
+            return str(candidate)
+    raise FirewallError(f"No free network left in mcp_subnet {conf['mcp_subnet']}; set a larger one in {CONFIG}.")
 
 
 def profile_sets(record, common, proxies):
@@ -604,10 +719,15 @@ def lease_transaction(profile, kinds=KINDS, seconds=None):
     return text
 
 
+def targets(data):
+    """All firewalls: protected profiles and MCP servers ("PROFILE/SERVER")."""
+    return sorted([*data["profiles"], *data.get("mcp", {})])
+
+
 def refresh_transaction(data, sets):
-    """Replace all address sets of every table; leases stay untouched. sets: {profile: {set: [..]}}."""
+    """Replace all address sets of every table; leases stay untouched. sets: {name: {set: [..]}}."""
     text = ""
-    for profile in sorted(data["profiles"]):
+    for profile in targets(data):
         table = identity(profile)["table"]
         for name, _, _ in SETS:
             text += f"flush set inet {table} {name}\n"
@@ -618,15 +738,19 @@ def refresh_transaction(data, sets):
 
 def all_sets(data, strict=False):
     conf = load_config()
-    if not data["profiles"]:
-        return {}
-    common, proxies = common_sets(conf, strict), proxy_ports(conf)
-    return {p: profile_sets(r, common, proxies) for p, r in data["profiles"].items()}
+    result = {}
+    if data["profiles"]:
+        common, proxies = common_sets(conf, strict), proxy_ports(conf)
+        result = {p: profile_sets(r, common, proxies) for p, r in data["profiles"].items()}
+    if data.get("mcp"):
+        addresses = mcp_addresses(conf)
+        result.update({key: mcp_sets(conf, key, addresses) for key in data["mcp"]})
+    return result
 
 
 def restore_transaction(data):
     sets = all_sets(data)
-    return "".join(rules(profile, sets[profile]) for profile in sorted(data["profiles"]))
+    return "".join(rules(name, sets[name]) for name in targets(data))
 
 
 # --- state ---------------------------------------------------------------------------------
@@ -663,12 +787,16 @@ def validate_registry(data):
     require(type(data) is dict and data.get("version") == 2 and type(data.get("profiles")) is dict,
             f"Invalid {REGISTRY}; no automatic repair was attempted.")
     seen = set()
-    for profile, record in data["profiles"].items():
-        bridge = identity(profile)["bridge"]
-        require(type(record) is dict and set(record) == {"user", "ipv6", "label", "dns"}
+    require(type(data.get("mcp", {})) is dict, f"Invalid {REGISTRY}; no automatic repair was attempted.")
+    for name, record in [*data["profiles"].items(), *data.get("mcp", {}).items()]:
+        bridge = identity(name)["bridge"]
+        fields = {"user", "ipv6", "subnet", "dns"} if "/" in name else {"user", "ipv6", "label", "dns"}
+        require(type(record) is dict and set(record) == fields
                 and type(record["user"]) is str and type(record["ipv6"]) is bool
-                and type(record["label"]) is str and type(record["dns"]) is list,
-                f"Invalid registry entry for {profile}.")
+                and type(record.get("label", "")) is str and type(record.get("subnet", "")) is str
+                and type(record["dns"]) is list
+                and ("/" in name) == (name in data.get("mcp", {})),
+                f"Invalid registry entry for {name}.")
         require(bridge not in seen, "Profile bridge collision.")
         seen.add(bridge)
     return data
@@ -786,7 +914,10 @@ def set_elements(profile, name):
         for element in row.get("set", {}).get("elem", []):
             if isinstance(element, dict) and "elem" in element:
                 element = element["elem"].get("val")
-            if isinstance(element, dict) and "prefix" in element:
+            if isinstance(element, dict) and "concat" in element:
+                result.append(" ".join(f"{p['prefix']['addr']}/{p['prefix']['len']}" if isinstance(p, dict) and "prefix" in p
+                                       else str(p) for p in element["concat"]))
+            elif isinstance(element, dict) and "prefix" in element:
                 result.append(f"{element['prefix']['addr']}/{element['prefix']['len']}")
             elif isinstance(element, dict) and "range" in element:
                 result.append("-".join(element["range"]))
@@ -875,8 +1006,8 @@ def hermes(*arguments):
     return result.stdout
 
 
-def config_section(profile, section):
-    output = hermes("-p", profile, "config", "get", section, "--json")
+def config_section(profile, section, *options):
+    output = hermes("-p", profile, "config", "get", section, "--json", *options)
     try:
         settings = json.loads(output)
     except ValueError:
@@ -940,8 +1071,7 @@ def hermes_info(profile):
     arguments = [str(a) for a in settings.get("docker_extra_args") or []]
     for argument in arguments:
         firewall_arg(argument)
-    escapes = re.findall(r"--privileged\S*|\S*docker\.sock\S*|--pid[= ]host|--userns[= ]host|--cap-add[= ](?:ALL|SYS_ADMIN)",
-                         " ".join(arguments + [str(v) for v in settings.get("docker_volumes") or []]))
+    escapes = re.findall(ESCAPES, " ".join(arguments + [str(v) for v in settings.get("docker_volumes") or []]))
     if escapes:
         hints.append(f"Warning: {', '.join(escapes)} lets code escape the sandbox; no firewall can contain it then.")
     return {"key": key, "hints": hints}
@@ -1001,16 +1131,147 @@ def hermes_detach(profile):
         remove_plugin_files(target)
 
 
+def mcp_servers(profile):
+    """The mcp_servers section as Hermes resolves it (${VAR} expanded), not masked; {} if there is none."""
+    try:
+        return config_section(profile, "mcp_servers", "--raw")
+    except FirewallError as error:
+        if "not set" in str(error):
+            return {}
+        raise
+
+
+def config_file_text(profile):
+    """The profile's config.yaml as it is on disk; "" if unreadable."""
+    try:
+        return (hermes_home(Path.home(), profile) / "config.yaml").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return ""
+
+
+def own_mcp_args(arguments):
+    """`docker run` arguments -> (what the firewall put right after `run`, everything else)."""
+    own = []
+    for argument in arguments[1:]:
+        if not re.fullmatch(r"--network=(none|hermes-mcp-\S+)|--dns=\S+", argument):
+            break
+        own.append(argument)
+    return own, arguments[len(own) + 1:]
+
+
+def mcp_state(profile, name, entry, config_text):
+    """How an mcp_servers entry stands to the firewall: (state, what to tell the user). The states:
+    protected, isolated (no network), ready (can be written), manual (a hint only), refused, url, host, off.
+
+    Only a plain `docker run` whose arguments are literally in config.yaml is ever changed: Hermes hands
+    out values with ${VAR} already expanded, and writing those back would put secrets into the file."""
+    fix = f"sudo hermes-firewall mcp add {profile} {name}"
+    if entry.get("enabled") is False:
+        return "off", "is switched off."
+    if entry.get("url"):
+        return "url", "is reached over HTTP (url); Hermes does not start it, so no firewall is set up for it."
+    command = str(entry.get("command") or "")
+    arguments = [str(a) for a in entry.get("args") or []] if type(entry.get("args") or []) is list else []
+    everything = " ".join([command, *arguments])
+    docker = Path(command).name == "docker"
+    if not docker and not re.search(r"\b(docker|podman)\b", everything):
+        return "host", f"runs directly on the host ({Path(command).name}), not in a container: no firewall possible."
+    if not re.fullmatch(SERVER_RE, name):
+        return "refused", "has a name the Hermes CLI cannot address (use letters, digits, '_' and '-'); rename it first."
+    escapes = re.findall(ESCAPES, everything)
+    if escapes:
+        return "refused", f"uses {', '.join(escapes)}, so code can leave the container; no firewall can contain it."
+    if type(entry.get("env")) is dict and {"DOCKER_HOST", "DOCKER_CONTEXT"} & set(entry["env"]):
+        return "refused", "sets DOCKER_HOST or DOCKER_CONTEXT in its env, so it may start on a Docker this firewall does not protect."
+    network = identity(f"{profile}/{name}")["network"]
+    manual = (f"starts Docker in a way hermes-firewall does not change by itself ({{}}). {fix} creates its network; "
+              f"then add --network={network} to its command yourself.")
+    if not docker or arguments[:1] != ["run"]:
+        if network in everything:
+            return "protected", "runs in Docker behind its firewall (set up by hand)."
+        return "manual", manual.format("no plain docker run")
+    own, rest = own_mcp_args(arguments)
+    foreign = [a for a in rest if re.fullmatch(r"--(network|net|dns)(=.*)?", a)]
+    if foreign:
+        return "refused", f"sets {foreign[0]} itself; remove that from its args first, then: {fix}"
+    if f"--network={network}" in own:
+        return "protected", "runs in Docker behind its firewall."
+    if "--network=none" in own:
+        return "isolated", "runs in Docker without any network."
+    if any(a.startswith("--network=") for a in own):
+        return "refused", f"uses the firewall network of another MCP server; remove that from its args first, then: {fix}"
+    if not all(a in config_text for a in arguments):
+        return "manual", manual.format("its args use ${VAR} or special quoting")
+    return "ready", f"runs in Docker WITHOUT a firewall. Fix: add an [[mcp]] entry to {CONFIG}, then: {fix}"
+
+
+def hermes_mcp_scan(profile):
+    text = config_file_text(profile)
+    report = []
+    for name, entry in sorted(mcp_servers(profile).items()):
+        state, message = mcp_state(profile, name, entry, text) if type(entry) is dict else ("off", "is not a valid entry.")
+        report.append({"name": name, "state": state, "text": message})
+    print(json.dumps(report))
+
+
+def set_mcp_args(profile, server, wanted):
+    hermes("-p", profile, "config", "set", f"mcp_servers.{server}.args", json.dumps(wanted))
+    require(mcp_servers(profile).get(server, {}).get("args") == wanted,
+            f"Hermes did not take the new arguments of MCP server {server}; check {server} in its config.yaml.")
+
+
+def hermes_mcp_attach(profile, server):
+    """Put the server's firewall network right after `docker run`; the rest stays as it is."""
+    key, conf = f"{profile}/{server}", load_config()
+    entry = mcp_servers(profile).get(server)
+    require(type(entry) is dict, f"{profile} has no MCP server {server}.")
+    # A server that is switched off counts as it is: the firewall can be set up before it runs.
+    state, message = mcp_state(profile, server, {**entry, "enabled": True}, config_file_text(profile))
+    require(state in ("ready", "isolated", "protected", "manual"), f"MCP server {server} {message}")
+    arguments = [str(a) for a in entry.get("args") or []]
+    if state == "manual" or arguments[:1] != ["run"]:
+        return  # the user set it up by hand, or will
+    wanted = ["run", f"--network={identity(key)['network']}", *(f"--dns={s}" for s in mcp_dns(conf, key)),
+              *own_mcp_args(arguments)[1]]
+    if wanted != arguments:
+        require(all(a in config_file_text(profile) for a in arguments),
+                f"The args of MCP server {server} use ${{VAR}} or special quoting: change them yourself: {' '.join(wanted[:-1])}")
+        set_mcp_args(profile, server, wanted)
+
+
+def hermes_mcp_detach(profile, server):
+    """Without its firewall the server gets NO network, never an unfiltered one."""
+    entry = mcp_servers(profile).get(server)
+    if type(entry) is not dict:
+        return
+    arguments = [str(a) for a in entry.get("args") or []]
+    if Path(str(entry.get("command") or "")).name == "docker" and arguments[:1] == ["run"] \
+            and all(a in config_file_text(profile) for a in arguments):
+        set_mcp_args(profile, server, ["run", "--network=none", *own_mcp_args(arguments)[1]])
+        print("It runs without any network now.")
+    else:
+        print(f"Its command still names the removed network, so it will not start: change it in the args of {server}.")
+
+
 def user_command(words):
-    """`_hermes info|attach|detach PROFILE`: called by root via runuser as the Hermes user."""
+    """`_hermes info|attach|detach PROFILE` and `_hermes mcp-scan PROFILE`, `_hermes mcp-attach|mcp-detach
+    PROFILE SERVER`: called by root via runuser as the Hermes user."""
     require(os.geteuid() != 0, "Internal command; it runs as the Hermes user, not as root.")
-    require(len(words) == 3 and words[1] in ("info", "attach", "detach"), "Unknown internal command.")
-    action, profile = words[1], words[2]
-    identity(profile)
+    action = words[1] if len(words) > 1 else ""
+    if action in ("mcp-attach", "mcp-detach"):
+        require(len(words) == 4, "Unknown internal command.")
+        identity(f"{words[2]}/{words[3]}")
+        (hermes_mcp_attach if action == "mcp-attach" else hermes_mcp_detach)(words[2], words[3])
+        return
+    require(len(words) == 3 and action in ("info", "attach", "detach", "mcp-scan"), "Unknown internal command.")
+    profile = words[2]
+    require(re.fullmatch(PROFILE_RE, profile), f"Not a Hermes profile name: {profile!r}")
     if action == "info":
         print(json.dumps(hermes_info(profile)))
     elif action == "attach":
         hermes_attach(profile, load_config()["dns"])
+    elif action == "mcp-scan":
+        hermes_mcp_scan(profile)
     else:
         hermes_detach(profile)
 
@@ -1129,6 +1390,7 @@ def write_sudoers(data):
 
 def record_of(data, profile):
     identity(profile)
+    require("/" not in profile, f"{profile} is an MCP firewall: it never opens. Its allow list is in {CONFIG}.")
     require(profile in data["profiles"], f"{profile} is not protected. To protect it: sudo hermes-firewall add {profile}")
     return data["profiles"][profile]
 
@@ -1155,15 +1417,19 @@ def ipv6_enabled(conf):
 
 def create_firewall(data, profile, record, conf):
     item = identity(profile)
-    require(all(item["bridge"] != identity(p)["bridge"] for p in data["profiles"]), "Bridge collision.")
+    require(all(item["bridge"] != identity(p)["bridge"] for p in targets(data)), "Bridge collision.")
     docker_ready()
     run("systemctl", "is-active", "--quiet", SERVICE)
     require(item["network"] not in networks(), f"Network already exists: {item['network']}")
     require(item["table"] not in table_names(), f"Firewall table already exists: {item['table']}")
     require(not interface_exists(item["bridge"]), f"Interface already exists: {item['bridge']}")
-    text = rules(profile, profile_sets(record, common_sets(conf, strict=True), proxy_ports(conf)))
+    if "/" in profile:
+        sets = mcp_sets(conf, profile, mcp_addresses(conf))
+    else:
+        sets = profile_sets(record, common_sets(conf, strict=True), proxy_ports(conf))
+    text = rules(profile, sets)
     run("nft", "--check", "--file", "-", input=text)
-    data["profiles"][profile] = record
+    (data.setdefault("mcp", {}) if "/" in profile else data["profiles"])[profile] = record
     # Persist protection BEFORE making a network available; partial failure stays closed.
     save_registry(data)
     nft_apply(text)
@@ -1173,7 +1439,8 @@ def create_firewall(data, profile, record, conf):
 def create_network(profile, record):
     item = identity(profile)
     ipv6 = ["--ipv6", "--subnet", item["subnet6"]] if record["ipv6"] else ["--ipv6=false"]
-    run("docker", "network", "create", "--driver", "bridge", *ipv6,
+    subnet = ["--subnet", record["subnet"]] if record.get("subnet") else []
+    run("docker", "network", "create", "--driver", "bridge", *ipv6, *subnet,
         "--opt", f"com.docker.network.bridge.name={item['bridge']}",
         "--opt", "com.docker.network.bridge.enable_icc=false",
         "--label", f"{LABEL}={profile}", item["network"])
@@ -1186,7 +1453,7 @@ def restart_hint(profile):
 
 
 def add_profile(data, profile, user, yes=False):
-    identity(profile)
+    require(re.fullmatch(PROFILE_RE, profile), f"Not a Hermes profile name: {profile!r}")
     require(hermes_home(user.pw_dir, profile).is_dir(),
             f"No Hermes profile {profile} for {user.pw_name} ({hermes_home(user.pw_dir, profile)} missing).")
     existing = data["profiles"].get(profile)
@@ -1220,7 +1487,8 @@ def add_profile(data, profile, user, yes=False):
     data["profiles"][profile]["dns"] = conf["dns"]
     save_registry(data)
     write_sudoers(data)
-    for message in [*info["hints"], *protect_sandboxes(profile, data["profiles"][profile], conf, True, yes)]:
+    for message in [*info["hints"], *protect_sandboxes(profile, data["profiles"][profile], conf, True, yes),
+                    *mcp_warnings(profile, user)]:
         print(message)
     write_state(profile)
     print(profile_line(profile))
@@ -1231,6 +1499,8 @@ def add_profile(data, profile, user, yes=False):
 def remove_profile(data, profile):
     record = record_of(data, profile)
     item = identity(profile)
+    servers = [key.split("/")[1] for key in data.get("mcp", {}) if key.startswith(f"{profile}/")]
+    require(not servers, f"First remove the MCP firewalls of {profile}: sudo hermes-firewall mcp remove {profile} {servers[0] if servers else ''}")
     docker_ready()
     exists = item["network"] in networks()
     if exists:
@@ -1273,6 +1543,112 @@ def close_lease(data, profile, words):
     print(profile_line(profile))
 
 
+# --- MCP servers ----------------------------------------------------------------------------
+
+def mcp_report(user, profile):
+    """The profile's MCP servers as seen by the Hermes user's process; its output is not trusted."""
+    answer = as_user(user, "mcp-scan", profile)
+    try:
+        report = json.loads((answer.strip().splitlines() or [""])[-1])
+        require(type(report) is list and all(type(s) is dict and {type(s.get(k)) for k in ("name", "state", "text")} == {str}
+                                             for s in report), "")
+    except (ValueError, FirewallError):
+        raise FirewallError(f"Unexpected answer when reading the MCP servers of {profile}.") from None
+    return report
+
+
+def mcp_warnings(profile, user):
+    """One line for every MCP server of the profile that runs in Docker without a firewall."""
+    try:
+        report = mcp_report(user, profile)
+    except FirewallError as error:
+        return [f"{profile}: WARNING - could not check its MCP servers: {error}"]
+    return [f"{profile}: WARNING - MCP server {s['name']} {s['text']}" for s in report
+            if s["state"] in ("ready", "manual", "refused")]
+
+
+def mcp_owners(data):
+    """{profile: user} of everything that can have MCP servers to check."""
+    owners = {p: r["user"] for p, r in data["profiles"].items()}
+    owners.update({key.split("/")[0]: r["user"] for key, r in data.get("mcp", {}).items()})
+    return dict(sorted(owners.items()))
+
+
+def allowed_text(conf, key):
+    """What this MCP server can reach, for the user."""
+    parts = [f"{t.get('net') or t['host']}" + "".join(f" {p} {','.join(map(str, t[p]))}" for p in ("tcp", "udp") if t[p])
+             for t in conf["mcp"].get(key, [])]
+    return "; ".join(parts) or "nothing"
+
+
+def mcp_scan(profile, user):
+    report = mcp_report(user, profile)
+    print(f"{profile}: MCP servers" if report else f"{profile}: no MCP servers.")
+    for server in report:
+        print(f"  {server['name']} {server['text']}")
+
+
+def mcp_add(data, profile, server, user):
+    key = f"{profile}/{server}"
+    item = identity(key)
+    require(hermes_home(user.pw_dir, profile).is_dir(),
+            f"No Hermes profile {profile} for {user.pw_name} ({hermes_home(user.pw_dir, profile)} missing).")
+    conf = load_config()
+    require(key in conf["mcp"], f"No allow list for {key} yet. Add it to {CONFIG}, then run this again:\n\n"
+                                f'[[mcp]]\nprofile = "{profile}"\nserver = "{server}"\n'
+                                'allow = [{ host = "api.example.org", tcp = [443] }]    # [] = nothing at all')
+    existing = data.get("mcp", {}).get(key)
+    require(not existing or existing["user"] == user.pw_name,
+            f"{key} is protected for user {existing and existing['user']}; run this as that user.")
+    found = {s["name"]: s for s in mcp_report(user, profile)}
+    require(server in found, f"{profile} has no MCP server {server}. See: sudo hermes-firewall mcp scan {profile}")
+    state, message = found[server]["state"], found[server]["text"]
+    require(state in ("ready", "isolated", "protected", "manual", "off"), f"MCP server {server} {message}")
+    if existing:
+        health(key)  # Running it again repairs the network and the Hermes side.
+        docker_ready()
+        if item["network"] not in networks():
+            create_network(key, existing)
+        check_network(key, existing)
+    else:
+        docker_ready()
+        record = {"user": user.pw_name, "ipv6": ipv6_enabled(conf), "subnet": free_subnet(data, conf), "dns": []}
+        create_firewall(data, key, record, conf)
+    as_user(user, "mcp-attach", profile, server)
+    dns = mcp_dns(conf, key)
+    data["mcp"][key]["dns"] = dns
+    save_registry(data)
+    print(f"{key}: firewall active, can reach only: {allowed_text(conf, key)}")
+    if state == "manual":
+        print(f"Add this to its docker command yourself: --network={item['network']} "
+              + " ".join(f"--dns={s}" for s in dns))
+    print("It applies when the server starts again: /reload-mcp in the chat, or restart the gateway.")
+
+
+def mcp_remove(data, profile, server):
+    key = f"{profile}/{server}"
+    item = identity(key)
+    require(key in data.get("mcp", {}), f"{key} has no firewall.")
+    record = data["mcp"][key]
+    docker_ready()
+    exists = item["network"] in networks()
+    if exists:
+        check_network(key, record)
+    note = []
+    user = pwd.getpwnam(record["user"])
+    if hermes_home(user.pw_dir, profile).is_dir():
+        note = as_user(user, "mcp-detach", profile, server).strip().splitlines()[-1:]
+    if exists:
+        for container in run("docker", "ps", "-aq", "--filter", f"network={item['network']}").stdout.split():
+            run("docker", "network", "disconnect", "-f", item["network"], container)
+        run("docker", "network", "rm", item["network"])
+    require(not interface_exists(item["bridge"]), f"Bridge still exists: {item['bridge']}; protection kept.")
+    nft_apply(drop_table(item["table"]))
+    del data["mcp"][key]
+    save_registry(data)
+    print(f"{key}: firewall removed. {' '.join(note)}".strip())
+
+
 def status(data, user=None, selected=None, verbose=False):
     if selected:
         record_of(data, selected)
@@ -1281,7 +1657,7 @@ def status(data, user=None, selected=None, verbose=False):
         profiles = sorted(set(data["profiles"]) | (hermes_profiles(user) if user else set()))
     if not profiles:
         print("No Hermes profiles found.")
-    conf = load_config() if data["profiles"] else None
+    conf = load_config() if targets(data) else None
     problems = []
     for profile in profiles:
         if profile not in data["profiles"]:
@@ -1313,8 +1689,40 @@ def status(data, user=None, selected=None, verbose=False):
             for container in sandboxes(data["profiles"][profile]["label"]):
                 print(f"  sandbox {container['Name'].lstrip('/')}: {container['State']['Status']}, networks "
                       f"{', '.join((container.get('NetworkSettings') or {}).get('Networks') or {}) or 'none'}")
-    if conf and not selected:
+    if data["profiles"] and not selected:
         print(f"Always reachable from protected sandboxes: {always_text(conf)}")
+    for key, record in sorted(data.get("mcp", {}).items()):
+        if selected and not key.startswith(f"{selected}/"):
+            continue
+        profile, server = key.split("/")
+        try:
+            health(key)
+        except FirewallError as error:
+            problems.append(key)
+            print(f"{key}: ERROR - the firewall is not working ({error}). "
+                  "Fix: sudo hermes-firewall restore (closes all leases)")
+            continue
+        try:
+            require(identity(key)["network"] in networks(), "its Docker network is missing")
+            check_network(key, record)
+        except FirewallError as error:
+            problems.append(key)
+            print(f"{key}: ERROR - {error}. Fix: sudo hermes-firewall mcp add {profile} {server}")
+            continue
+        print(f"{key}: firewall active, can reach only: {allowed_text(conf, key)}")
+        if key not in conf["mcp"]:
+            print(f"{key}: WARNING - no [[mcp]] entry in {CONFIG}, so it reaches nothing.")
+        if verbose:
+            item = identity(key)
+            print(f"  network {item['network']} ({record['subnet']}), bridge {item['bridge']}, table inet {item['table']}")
+            print(f"  allowed now: {', '.join(set_elements(key, 'allow_ports_v4') + set_elements(key, 'allow_ports_v6')) or 'nothing'}")
+    if not selected:
+        for profile, owner in mcp_owners(data).items():
+            try:
+                for message in mcp_warnings(profile, pwd.getpwnam(owner)):
+                    print(message)
+            except KeyError:
+                print(f"{profile}: WARNING - user {owner} does not exist.")
     unsafe = replaceable_by_others(EXE) if data["profiles"] else []
     if unsafe:
         problems.append("program")
@@ -1334,7 +1742,7 @@ def refresh(data):
         except (FirewallError, OSError, KeyError, ValueError, subprocess.SubprocessError) as error:
             problems.append(f"{what}: {error}")
     def heal():
-        missing = [p for p in sorted(data["profiles"]) if identity(p)["table"] not in table_names()]
+        missing = [p for p in targets(data) if identity(p)["table"] not in table_names()]
         if missing:
             sets = all_sets(data)
             nft_apply("".join(rules(p, sets[p]) for p in missing))
@@ -1352,6 +1760,16 @@ def refresh(data):
         attempt(profile, follow_dns)
         attempt(profile, lambda: [print(m) for m in protect_sandboxes(profile, record, conf)])
         write_state(profile)
+    for key, record in sorted(data.get("mcp", {}).items()):
+        def follow_mcp_dns():
+            if record["dns"] != mcp_dns(conf, key):
+                as_user(pwd.getpwnam(record["user"]), "mcp-attach", *key.split("/"))
+                record["dns"] = mcp_dns(conf, key)
+                save_registry(data)
+                print(f"{key}: its DNS servers changed; this applies when the server starts again.")
+        attempt(key, follow_mcp_dns)
+    for profile, owner in mcp_owners(data).items():
+        attempt(profile, lambda: [print(m) for m in mcp_warnings(profile, pwd.getpwnam(owner))])
     require(not problems, "; ".join(problems))
 
 
@@ -1451,7 +1869,7 @@ def upgrade(bundle):
     run("systemctl", "enable", "--now", REFRESH_TIMER.name)
     write_sudoers(data)
     outdated = []
-    for profile in sorted(data["profiles"]):
+    for profile in targets(data):
         try:
             health(profile)
         except FirewallError:
@@ -1459,7 +1877,7 @@ def upgrade(bundle):
     if outdated:
         # The rule layout changed: reload all tables in one transaction (closes all leases).
         nft_apply(restore_transaction(data))
-    elif data["profiles"]:
+    elif targets(data):
         try:
             nft_apply(refresh_transaction(data, all_sets(data, strict=True)))
         except FirewallError as error:
@@ -1478,7 +1896,8 @@ def upgrade(bundle):
 
 
 def uninstall(data, purge=False):
-    require(not data["profiles"], "Remove the protected profiles first: sudo hermes-firewall remove PROFILE")
+    require(not targets(data), "Remove the protected profiles and MCP firewalls first: "
+                               "sudo hermes-firewall remove PROFILE, sudo hermes-firewall mcp remove PROFILE SERVER")
     docker_ready()
     require(not run("docker", "network", "ls", "-q", "--filter", f"label={LABEL}").stdout.strip(),
             "Docker networks of hermes-firewall remain; refusing uninstall.")
@@ -1515,6 +1934,9 @@ USAGE = """usage:
   hermes-firewall close PROFILE [internet|lan|all]
   hermes-firewall status [PROFILE] [--verbose]
   hermes-firewall remove PROFILE                  remove the firewall; the sandbox then has no network
+  hermes-firewall mcp scan PROFILE                what the profile's MCP servers can reach
+  hermes-firewall mcp add PROFILE SERVER          lock a Docker MCP server to its allow list in config.toml
+  hermes-firewall mcp remove PROFILE SERVER       remove its firewall; the server then has no network
   hermes-firewall refresh | restore | uninstall [--purge]
 
 examples (as the user running Hermes):
@@ -1601,6 +2023,12 @@ def main(argv=None):
             open_lease(data, rest[0], rest[1:])
         elif verb == "close" and rest:
             close_lease(data, rest[0], rest[1:])
+        elif verb == "mcp" and len(rest) == 2 and rest[0] == "scan":
+            mcp_scan(rest[1], hermes_user())
+        elif verb == "mcp" and len(rest) == 3 and rest[0] == "add":
+            mcp_add(data, rest[1], rest[2], hermes_user())
+        elif verb == "mcp" and len(rest) == 3 and rest[0] == "remove":
+            mcp_remove(data, rest[1], rest[2])
         else:
             raise FirewallError("Did not understand that. See: hermes-firewall --help")
 

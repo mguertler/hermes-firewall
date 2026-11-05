@@ -13,6 +13,7 @@ These must stay true. Change them only deliberately, together with tests and doc
 - Protection first: the table exists before the Docker network; the network is removed before the table. Detach leaves a sandbox with NO network, never an unfiltered one.
 - Connections a sandbox may not make are refused at once (TCP reset, otherwise ICMP admin-prohibited), never left to time out; traffic from outside to a sandbox is dropped silently.
 - Every change of the rules changes the layout fingerprint, so `upgrade` reloads the tables instead of leaving old rules in place.
+- An MCP firewall never opens: no leases, no `open`/`close`, no sudoers rule. Its container reaches only the targets and ports of its allow list in the root-owned `config.toml`, DNS only if that list has names, and never the host. Removing it leaves the server with no network, never an unfiltered one.
 - `bash tests/netns.sh` must pass after any rule change.
 
 ## Scope of changes
@@ -21,7 +22,8 @@ These must stay true. Change them only deliberately, together with tests and doc
 - Profiles are independent: adding or removing one never changes another's leases.
 - Root never edits Hermes files. Only `_hermes info|attach|detach`, run as the Hermes user, changes a profile, and only through the Hermes CLI. Root never trusts what that process prints: it validates the answer, computes container labels itself, strips control characters and gives the process no terminal (no stdin, new session).
 - Sandboxes of one protected profile are never moved into another's network; two protected profiles never share a container label.
-- In a Hermes profile only `terminal.docker_network` and the own `--network=` / `--dns=` entries of `terminal.docker_extra_args` are set, plus the plugin directory. Never `container_persistent`, `docker_shared_container_key`, `cwd`, `backend` or other settings: for those, only hints.
+- In a Hermes profile only `terminal.docker_network`, the own `--network=` / `--dns=` entries of `terminal.docker_extra_args` and the own entries right after `run` in `mcp_servers.NAME.args` are set, plus the plugin directory. Never `container_persistent`, `docker_shared_container_key`, `cwd`, `backend` or other settings: for those, only hints.
+- Values from `hermes config get` are never written back unless they are literally in `config.yaml`: Hermes expands `${VAR}`, and writing that back would put secrets into the file.
 - Sandboxes are moved (restricting only) without asking; a sandbox is removed (reset) only after confirmation on a terminal or `add --yes`, and only containers carrying the profile's Hermes labels.
 - Files are removed only when known to be ours: plugin files by name, no recursive deletion; `uninstall` refuses unknown files and remaining networks/tables.
 - The model never gets a way to open the firewall: `/firewall` is a slash command (user only), no tool. What the model is told only ever informs it, and each part has its own switch. `prompt_rule` (on by default) is the frozen rule and holds no state, because a frozen state would go stale. `status_line` (off by default) adds one line to each user message. `agent_notice` (off by default) adds one line to the output of a sandbox command that failed with a network error while a lease is closed; never to other output.

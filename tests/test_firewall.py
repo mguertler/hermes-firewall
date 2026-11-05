@@ -64,7 +64,7 @@ class IdentityAndInputTests(unittest.TestCase):
         self.assertTrue(fw.identity("research")["subnet6"].endswith("::/64"))
 
     def test_unsafe_names_and_nft_injection_are_rejected(self):
-        for name in ("", "../research", "-x", "a/b", "a b", "a; flush ruleset", 'a"', "a\n", "a" * 65, "ä",
+        for name in ("", "../research", "-x", "a/b/c", "/a", "a/", "a b", "a; flush ruleset", 'a"', "a\n", "a" * 65, "ä",
                      "Research", "a.b"):
             with self.subTest(name=name), self.assertRaises(fw.FirewallError):
                 fw.rules(name)
@@ -448,6 +448,7 @@ class ProfileTests(unittest.TestCase):
              patch.object(fw, "create_network") as network, patch.object(fw, "create_firewall") as create, \
              patch.object(fw, "ipv6_enabled", return_value=False), patch.object(fw, "save_registry"), \
              patch.object(fw, "write_sudoers") as sudoers, patch.object(fw, "protect_sandboxes", return_value=[]), \
+             patch.object(fw, "mcp_warnings", return_value=[]), \
              patch.object(fw, "profile_line", return_value="research: firewall active"), patch("builtins.print") as output:
             create.side_effect = lambda d, p, r, c: d["profiles"].__setitem__(p, r)
             fw.add_profile(data, "research", user)
@@ -879,6 +880,389 @@ class ProgramPathTests(unittest.TestCase):
                 with self.assertRaisesRegex(fw.FirewallError, "program"):
                     fw.status(registry("research"))
         self.assertIn("can be changed by non-root users", output.call_args.args[0])
+
+
+class McpConfigTests(unittest.TestCase):
+    BASE = '[sandbox]\ndns = ["192.168.0.5"]\n'
+
+    def test_allow_list_of_nets_and_names_with_ports(self):
+        conf = load(self.BASE + """
+[[mcp]]
+profile = "research"
+server = "github"
+allow = [{ net = "140.82.112.0/20", tcp = [443] }, { host = "api.github.com", tcp = [443, 80], udp = [443] }]
+
+[[mcp]]
+profile = "research"
+server = "offline"
+""")
+        self.assertEqual(conf["mcp"]["research/github"], [
+            {"net": "140.82.112.0/20", "tcp": [443], "udp": []},
+            {"host": "api.github.com", "tcp": [80, 443], "udp": [443]}])
+        self.assertEqual(conf["mcp"]["research/offline"], [])
+        self.assertEqual(conf["mcp_subnet"], fw.MCP_SUBNET)
+
+    def test_every_target_names_its_ports_and_nothing_else_is_accepted(self):
+        for entry, message in (('allow = [{ net = "1.2.3.4" }]', "ports"),
+                               ('allow = [{ host = "x.org", tcp = [] }]', "ports"),
+                               ('allow = [{ net = "1.2.3.4", host = "x.org", tcp = [1] }]', "net or host"),
+                               ('allow = [{ tcp = [1] }]', "net or host"),
+                               ('allow = [{ net = "nope", tcp = [1] }]', "not an address"),
+                               ('allow = [{ net = "0.0.0.0/0", tcp = [443] }]', "whole address family"),
+                               ('allow = [{ host = "a b", tcp = [1] }]', "not a host name"),
+                               ('allow = [{ net = "1.2.3.4", tcp = [70000] }]', "port numbers"),
+                               ('allow = "x"', "must be a list"),
+                               ('oops = 1', "take profile")):
+            with self.subTest(entry=entry), self.assertRaisesRegex(fw.FirewallError, message):
+                load(self.BASE + f'[[mcp]]\nprofile = "research"\nserver = "github"\n{entry}\n')
+
+    def test_bad_names_duplicates_and_subnets_are_refused(self):
+        with self.assertRaises(fw.FirewallError):
+            load(self.BASE + '[[mcp]]\nprofile = "Research"\nserver = "x"\n')
+        with self.assertRaises(fw.FirewallError):
+            load(self.BASE + '[[mcp]]\nprofile = "research"\nserver = "a.b"\n')
+        with self.assertRaisesRegex(fw.FirewallError, "Two"):
+            load(self.BASE + '[[mcp]]\nprofile = "r"\nserver = "x"\n[[mcp]]\nprofile = "r"\nserver = "x"\n')
+        for subnet in ("8.8.8.0/24", "fd00::/64", "10.0.0.0/30", "nope"):
+            with self.subTest(subnet=subnet), self.assertRaisesRegex(fw.FirewallError, "mcp_subnet"):
+                load(f'mcp_subnet = "{subnet}"\n' + self.BASE)
+
+
+MCP_CONF = {**CONF, "mcp_subnet": fw.MCP_SUBNET, "mcp": {
+    "research/github": [{"host": "api.github.com", "tcp": [443], "udp": []},
+                        {"net": "140.82.112.0/20", "tcp": [443], "udp": []}],
+    "research/ips": [{"net": "203.0.113.5/32", "tcp": [8080], "udp": [53]}, {"net": "2001:4860::/32", "tcp": [443], "udp": []}],
+    "research/off": []}}
+
+
+class McpSetTests(unittest.TestCase):
+    def test_identity_is_its_own_network_and_table(self):
+        item, profile = fw.identity("research/github"), fw.identity("research")
+        self.assertEqual(item["network"], "hermes-mcp-research-github")
+        self.assertNotEqual(item["bridge"], profile["bridge"])
+        self.assertNotEqual(item["table"], profile["table"])
+        self.assertLessEqual(len(item["bridge"]), 15)
+        self.assertTrue(item["table"].startswith("hermes_fw_"))
+
+    def test_only_the_allow_list_with_ports_and_dns_only_for_names(self):
+        sets = fw.mcp_sets(MCP_CONF, "research/github", {"api.github.com": ["140.82.112.5", "2606:50c0::1"]})
+        self.assertEqual(sets["allow_ports_v4"], ["140.82.112.0/20 . tcp . 443"])  # the address lies in the network
+        self.assertEqual(sets["allow_ports_v6"], ["2606:50c0::1/128 . tcp . 443"])
+        self.assertEqual(sets["dns_v4"], ["192.168.0.5"])
+        ips = fw.mcp_sets(MCP_CONF, "research/ips", {})
+        self.assertEqual(ips["allow_ports_v4"], ["203.0.113.5/32 . tcp . 8080", "203.0.113.5/32 . udp . 53"])
+        self.assertEqual((ips["dns_v4"], ips["dns_v6"]), ([], []))
+        self.assertEqual(fw.mcp_dns(MCP_CONF, "research/ips"), [fw.NO_DNS])
+        self.assertEqual(fw.mcp_dns(MCP_CONF, "research/github"), ["192.168.0.5"])
+
+    def test_nothing_opens_it_apart_from_its_list(self):
+        for key in ("research/off", "research/unknown"):
+            sets = fw.mcp_sets(MCP_CONF, key, {})
+            self.assertFalse(any(sets.values()), key)
+        text = fw.rules("research/ips", fw.mcp_sets(MCP_CONF, "research/ips", {}))
+        self.assertNotIn("192.168.0.5", text)
+        self.assertRegex(text, r"meta l4proto tcp counter reject with tcp reset\n\s+counter reject with icmpx")
+
+    def test_a_name_that_never_resolved_allows_nothing(self):
+        sets = fw.mcp_sets(MCP_CONF, "research/github", {})
+        self.assertEqual(sets["allow_ports_v4"], ["140.82.112.0/20 . tcp . 443"])
+        sets = fw.mcp_sets({**MCP_CONF, "mcp": {"r/x": [{"host": "a.org", "tcp": [443], "udp": []}]}}, "r/x", {})
+        self.assertEqual((sets["allow_ports_v4"], sets["allow_ports_v6"]), ([], []))
+
+    def addresses(self, directory, answer, now):
+        conf = {**CONF, "mcp": {"r/x": [{"host": "a.org", "tcp": [443], "udp": []}]}}
+        with patch.object(fw, "CACHE", Path(directory) / "resolved.json"), patch.object(fw, "trusted"), \
+             patch.object(fw, "resolve_host", **answer), patch.object(fw.time, "time", return_value=now), \
+             patch("builtins.print"):
+            return fw.mcp_addresses(conf)
+
+    def test_addresses_accumulate_survive_failures_and_age_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.addresses(directory, {"return_value": ["1.1.1.1"]}, 1000), {"a.org": ["1.1.1.1"]})
+            self.assertEqual(self.addresses(directory, {"return_value": ["2.2.2.2"]}, 2000), {"a.org": ["1.1.1.1", "2.2.2.2"]})
+            self.assertEqual(self.addresses(directory, {"side_effect": OSError("down")}, 3000), {"a.org": ["1.1.1.1", "2.2.2.2"]})
+            self.assertEqual(self.addresses(directory, {"return_value": ["2.2.2.2"]}, 1000 + fw.MCP_ADDRESS_KEEP), {"a.org": ["2.2.2.2"]})
+            self.assertEqual(self.addresses(directory, {"side_effect": OSError("down")}, 9 * fw.MCP_ADDRESS_KEEP), {})
+
+    def test_free_subnet_skips_what_is_in_use(self):
+        networks_json = json.dumps([{"IPAM": {"Config": [{"Subnet": "172.31.240.16/28"}, {"Subnet": "fd00::/64"}]}}])
+        routes = json.dumps([{"dst": "default"}, {"dst": "172.31.240.32/28"}])
+        def run(*arguments, **kwargs):
+            if arguments[:3] == ("docker", "network", "ls"):
+                return result("abc\n")
+            return result(networks_json if arguments[0] == "docker" else routes)
+        data = {"mcp": {"r/x": {"subnet": "172.31.240.0/28"}}}
+        with patch.object(fw, "run", side_effect=run):
+            self.assertEqual(fw.free_subnet(data, MCP_CONF), "172.31.240.48/28")
+            with self.assertRaisesRegex(fw.FirewallError, "No free network"):
+                fw.free_subnet(data, {**MCP_CONF, "mcp_subnet": "172.31.240.0/27"})
+
+
+class McpStateTests(unittest.TestCase):
+    def state(self, entry, text=None, name="github"):
+        arguments = entry.get("args") or []
+        return fw.mcp_state("research", name, entry, " ".join(map(str, arguments)) if text is None else text)
+
+    def docker(self, *arguments):
+        return {"command": "docker", "args": ["run", *arguments, "-i", "--rm", "ghcr.io/x/y"]}
+
+    def test_a_plain_docker_run_can_be_changed(self):
+        self.assertEqual(self.state(self.docker())[0], "ready")
+        self.assertEqual(self.state({"command": "/usr/bin/docker", "args": ["run", "img"]})[0], "ready")
+        self.assertIn("mcp add research github", self.state(self.docker())[1])
+
+    def test_expanded_values_are_never_written_back(self):
+        # config.yaml says ${TOKEN}; Hermes hands out the value.
+        entry = self.docker("-e", "TOKEN=ghp_secret")
+        self.assertEqual(self.state(entry, "args: [run, -e, 'TOKEN=${TOKEN}', -i, --rm, ghcr.io/x/y]")[0], "manual")
+        self.assertEqual(self.state(entry, "")[0], "manual")
+
+    def test_protected_and_isolated_are_recognised(self):
+        self.assertEqual(self.state(self.docker("--network=hermes-mcp-research-github", "--dns=9.9.9.9"))[0], "protected")
+        self.assertEqual(self.state(self.docker("--network=none"))[0], "isolated")
+        self.assertEqual(self.state({"command": "bash", "args": ["-c", "docker run --network=hermes-mcp-research-github i"]})[0], "protected")
+
+    def test_foreign_networks_and_escapes_are_refused(self):
+        for entry in (self.docker("--network=host"), self.docker("--network", "bridge"), self.docker("--net=host"),
+                      self.docker("-i", "--dns=8.8.8.8"), self.docker("--network=hermes-mcp-research-other"),
+                      {"command": "docker", "args": ["run", "img", "--network=x"]},
+                      self.docker("--privileged"), self.docker("-v", "/var/run/docker.sock:/s"), self.docker("--pid=host"),
+                      self.docker("--cap-add=SYS_ADMIN")):
+            with self.subTest(entry=entry):
+                self.assertEqual(self.state(entry)[0], "refused")
+        self.assertEqual(self.state(self.docker(), name="a.b")[0], "refused")
+        self.assertEqual(self.state({**self.docker(), "env": {"DOCKER_HOST": "tcp://other:2375"}})[0], "refused")
+        self.assertEqual(self.state({**self.docker(), "env": {"TOKEN": "x"}})[0], "ready")
+
+    def test_other_ways_to_start_docker_get_a_hint_only(self):
+        for entry in ({"command": "docker", "args": ["compose", "run", "x"]}, {"command": "docker", "args": ["exec", "-i", "c", "x"]},
+                      {"command": "docker", "args": ["--context", "x", "run", "i"]}, {"command": "bash", "args": ["-c", "docker run i"]},
+                      {"command": "podman", "args": ["run", "i"]}):
+            with self.subTest(entry=entry):
+                state, text = self.state(entry)
+                self.assertEqual(state, "manual")
+                self.assertIn("--network=hermes-mcp-research-github", text)
+
+    def test_what_is_no_container_is_named(self):
+        self.assertEqual(self.state({"command": "npx", "args": ["-y", "x"]})[0], "host")
+        self.assertEqual(self.state({"url": "https://x"})[0], "url")
+        self.assertEqual(self.state({**self.docker(), "enabled": False})[0], "off")
+
+
+class McpHermesSideTests(unittest.TestCase):
+    """As the Hermes user: only the args of the named server, and only own entries right after run."""
+    NETWORK = "--network=hermes-mcp-research-github"
+
+    def attach(self, arguments, conf=MCP_CONF, text=None, function=None):
+        calls, servers = [], {"github": {"command": "docker", "args": list(arguments)}}
+        def hermes(*words):
+            calls.append(words)
+            servers["github"]["args"] = json.loads(words[-1])
+        with patch.object(fw, "hermes", side_effect=hermes), patch.object(fw, "mcp_servers", return_value=servers), \
+             patch.object(fw, "config_file_text", return_value=" ".join(arguments) if text is None else text), \
+             patch.object(fw, "load_config", return_value=conf), patch("builtins.print") as output:
+            (function or fw.hermes_mcp_attach)("research", "github")
+        return calls, servers["github"]["args"], output
+
+    def test_network_and_dns_go_right_after_run(self):
+        calls, args, _ = self.attach(["run", "-i", "--rm", "img", "--flag"])
+        self.assertEqual(args, ["run", self.NETWORK, "--dns=192.168.0.5", "-i", "--rm", "img", "--flag"])
+        self.assertEqual(calls[0][:4], ("-p", "research", "config", "set"))
+        self.assertEqual(calls[0][4], "mcp_servers.github.args")
+        self.assertEqual(len(calls), 1)
+
+    def test_no_names_means_no_real_dns_server(self):
+        conf = {**MCP_CONF, "mcp": {"research/github": [{"net": "1.2.3.4/32", "tcp": [443], "udp": []}]}}
+        _, args, _ = self.attach(["run", "img"], conf)
+        self.assertEqual(args, ["run", self.NETWORK, f"--dns={fw.NO_DNS}", "img"])
+
+    def test_nothing_is_written_when_nothing_changes(self):
+        calls, _, _ = self.attach(["run", self.NETWORK, "--dns=192.168.0.5", "img"])
+        self.assertEqual(calls, [])
+
+    def test_changed_dns_replaces_only_own_entries(self):
+        _, args, _ = self.attach(["run", self.NETWORK, f"--dns={fw.NO_DNS}", "-i", "img"])
+        self.assertEqual(args, ["run", self.NETWORK, "--dns=192.168.0.5", "-i", "img"])
+
+    def test_args_with_expanded_values_are_not_written(self):
+        calls, _, _ = self.attach(["run", "-e", "T=secret", "img"], text="run -e T=${T} img")
+        self.assertEqual(calls, [])
+        with self.assertRaisesRegex(fw.FirewallError, "change them yourself"):
+            self.attach(["run", self.NETWORK, "--dns=9.9.9.9", "-e", "T=secret", "img"], text=f"run {self.NETWORK} --dns=9.9.9.9 -e T=${{T}} img")
+
+    def test_refused_servers_are_not_touched(self):
+        with self.assertRaisesRegex(fw.FirewallError, "--network=host"):
+            self.attach(["run", "--network=host", "img"])
+
+    def test_detach_leaves_no_network_never_an_unfiltered_one(self):
+        calls, args, output = self.attach(["run", self.NETWORK, "--dns=9.9.9.9", "-i", "img"], function=fw.hermes_mcp_detach)
+        self.assertEqual(args, ["run", "--network=none", "-i", "img"])
+        self.assertIn("without any network", output.call_args.args[0])
+
+    def test_attach_again_after_detach(self):
+        _, args, _ = self.attach(["run", "--network=none", "-i", "img"])
+        self.assertEqual(args, ["run", self.NETWORK, "--dns=192.168.0.5", "-i", "img"])
+
+    def test_a_server_that_is_switched_off_can_get_its_firewall_first(self):
+        calls, servers = [], {"github": {"command": "docker", "args": ["run", "img"], "enabled": False}}
+        def hermes(*words):
+            calls.append(words)
+            servers["github"]["args"] = json.loads(words[-1])
+        with patch.object(fw, "hermes", side_effect=hermes), patch.object(fw, "mcp_servers", return_value=servers), \
+             patch.object(fw, "config_file_text", return_value="run img --network=none hermes-mcp-research-github"), \
+             patch.object(fw, "load_config", return_value=MCP_CONF), patch("builtins.print"):
+            fw.hermes_mcp_attach("research", "github")
+            self.assertEqual(servers["github"]["args"], ["run", self.NETWORK, "--dns=192.168.0.5", "img"])
+            with patch.object(fw, "config_file_text", return_value=f"run {self.NETWORK} --dns=192.168.0.5 img"):
+                fw.hermes_mcp_detach("research", "github")
+            self.assertEqual(servers["github"]["args"], ["run", "--network=none", "img"])
+
+    def test_detach_of_a_hand_made_setup_says_what_to_do(self):
+        calls, _, output = self.attach(["run", self.NETWORK, "-e", "T=x", "img"], text="${T}", function=fw.hermes_mcp_detach)
+        self.assertEqual(calls, [])
+        self.assertIn("will not start", output.call_args.args[0])
+
+    def test_mcp_servers_reads_unmasked_and_tolerates_none(self):
+        with patch.object(fw, "hermes", return_value='{"a": {"url": "x"}}') as hermes:
+            self.assertEqual(fw.mcp_servers("research"), {"a": {"url": "x"}})
+        self.assertIn("--raw", hermes.call_args.args)
+        with patch.object(fw, "hermes", side_effect=fw.FirewallError("Config key not set: mcp_servers")):
+            self.assertEqual(fw.mcp_servers("research"), {})
+        with patch.object(fw, "hermes", side_effect=fw.FirewallError("boom")), self.assertRaises(fw.FirewallError):
+            fw.mcp_servers("research")
+
+    def test_internal_command_refuses_root_and_bad_names(self):
+        with patch.object(fw.os, "geteuid", return_value=1000):
+            for words in (["_hermes", "mcp-attach", "research"], ["_hermes", "mcp-attach", "research", "a.b"],
+                          ["_hermes", "mcp-scan", "research/x"], ["_hermes", "mcp-other", "research", "x"]):
+                with self.subTest(words=words), self.assertRaises(fw.FirewallError):
+                    fw.user_command(words)
+
+
+class McpCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.home.cleanup)
+        (Path(self.home.name) / ".hermes" / "profiles" / "research").mkdir(parents=True)
+        self.user = pwd.struct_passwd(("hermes", "x", 1000, 1000, "", self.home.name, "/bin/bash"))
+
+    def mcp_add(self, data, state="ready", existing_network=True, server="github", conf=MCP_CONF):
+        calls = []
+        def as_user(user, *arguments):
+            calls.append(arguments)
+            if arguments[0] == "mcp-scan":
+                return 'greeting\n' + json.dumps([{"name": "github", "state": state, "text": "says why"}]) + "\n"
+            return ""
+        with patch.object(fw, "load_config", return_value=conf), patch.object(fw, "as_user", side_effect=as_user), \
+             patch.object(fw, "health"), patch.object(fw, "docker_ready"), patch.object(fw, "check_network"), \
+             patch.object(fw, "networks", return_value={"hermes-mcp-research-github"} if existing_network else set()), \
+             patch.object(fw, "create_network") as network, patch.object(fw, "create_firewall") as create, \
+             patch.object(fw, "free_subnet", return_value="172.31.240.0/28"), patch.object(fw, "ipv6_enabled", return_value=False), \
+             patch.object(fw, "save_registry") as save, patch("builtins.print") as output:
+            create.side_effect = lambda d, k, r, c: d.setdefault("mcp", {}).__setitem__(k, r)
+            fw.mcp_add(data, "research", server, self.user)
+        return calls, create, network, save, "\n".join(c.args[0] for c in output.call_args_list)
+
+    def test_add_creates_the_firewall_before_touching_hermes(self):
+        data = registry()
+        calls, create, _, save, output = self.mcp_add(data)
+        create.assert_called_once()
+        self.assertEqual(calls, [("mcp-scan", "research"), ("mcp-attach", "research", "github")])
+        self.assertEqual(data["mcp"]["research/github"],
+                         {"user": "hermes", "ipv6": False, "subnet": "172.31.240.0/28", "dns": ["192.168.0.5"]})
+        fw.validate_registry(data)
+        save.assert_called()
+        self.assertIn("api.github.com tcp 443", output)
+        self.assertIn("/reload-mcp", output)
+
+    def test_add_again_repairs_the_network(self):
+        data = {**registry(), "mcp": {"research/github": {"user": "hermes", "ipv6": False, "subnet": "172.31.240.0/28", "dns": []}}}
+        _, create, network, _, _ = self.mcp_add(data, "protected", existing_network=False)
+        create.assert_not_called()
+        network.assert_called_once()
+
+    def test_add_needs_an_allow_list_in_the_root_owned_config(self):
+        conf = {**MCP_CONF, "mcp": {}}
+        with self.assertRaisesRegex(fw.FirewallError, r"\[\[mcp\]\]"):
+            self.mcp_add(registry(), conf=conf)
+
+    def test_add_refuses_what_it_cannot_protect(self):
+        for state in ("refused", "host", "url"):
+            with self.subTest(state=state), self.assertRaisesRegex(fw.FirewallError, "says why"):
+                self.mcp_add(registry(), state)
+        with self.assertRaisesRegex(fw.FirewallError, "no MCP server"):
+            self.mcp_add(registry(), server="research-x", conf={**MCP_CONF, "mcp": {"research/research-x": []}})
+
+    def test_manual_setups_get_the_network_and_a_hint(self):
+        _, create, _, _, output = self.mcp_add(registry(), "manual")
+        create.assert_called_once()
+        self.assertIn("--network=hermes-mcp-research-github --dns=192.168.0.5", output)
+
+    def test_remove_detaches_before_removing_network_and_protection(self):
+        data = {**registry(), "mcp": {"research/github": {"user": "hermes", "ipv6": False, "subnet": "172.31.240.0/28", "dns": []}}}
+        order = []
+        def run(*arguments, **kwargs):
+            order.append(arguments[:3])
+            return result("c1\n" if arguments[:2] == ("docker", "ps") else "")
+        with patch.object(fw, "docker_ready"), patch.object(fw, "networks", return_value={"hermes-mcp-research-github"}), \
+             patch.object(fw, "check_network"), patch.object(fw.pwd, "getpwnam", return_value=self.user), \
+             patch.object(fw, "as_user", side_effect=lambda u, *a: order.append(a) or "It runs without any network now.\n"), \
+             patch.object(fw, "run", side_effect=run), patch.object(fw, "interface_exists", return_value=False), \
+             patch.object(fw, "nft_apply", side_effect=lambda text: order.append("table")), patch.object(fw, "save_registry"), \
+             patch("builtins.print") as output:
+            fw.mcp_remove(data, "research", "github")
+        self.assertEqual(order[0], ("mcp-detach", "research", "github"))
+        self.assertLess(order.index(("docker", "network", "rm")), order.index("table"))
+        self.assertEqual(data["mcp"], {})
+        self.assertIn("without any network", output.call_args.args[0])
+
+    def test_profile_with_mcp_firewalls_is_not_removed_first(self):
+        data = {**registry("research"), "mcp": {"research/github": {"user": "hermes", "ipv6": False, "subnet": "172.31.240.0/28", "dns": []}}}
+        with self.assertRaisesRegex(fw.FirewallError, "mcp remove research github"):
+            fw.remove_profile(data, "research")
+
+    def test_uninstall_refuses_remaining_mcp_firewalls(self):
+        data = {**registry(), "mcp": {"research/github": {"user": "hermes", "ipv6": False, "subnet": "172.31.240.0/28", "dns": []}}}
+        with self.assertRaisesRegex(fw.FirewallError, "mcp remove"):
+            fw.uninstall(data)
+
+    def test_warnings_name_what_runs_without_a_firewall(self):
+        report = [{"name": n, "state": s, "text": "t"} for n, s in (("a", "ready"), ("b", "manual"), ("c", "refused"),
+                                                                    ("d", "protected"), ("e", "isolated"), ("f", "host"), ("g", "url"))]
+        with patch.object(fw, "mcp_report", return_value=report):
+            self.assertEqual([m.split()[5] for m in fw.mcp_warnings("research", self.user)], ["a", "b", "c"])
+        with patch.object(fw, "mcp_report", side_effect=fw.FirewallError("no")):
+            self.assertIn("could not check", fw.mcp_warnings("research", self.user)[0])
+
+    def test_untrusted_scan_answers_are_refused(self):
+        for answer in ("", "not json", "{}", '[{"name": "a"}]', '[{"name": 1, "state": "x", "text": "y"}]'):
+            with self.subTest(answer=answer), patch.object(fw, "as_user", return_value=answer), \
+                 self.assertRaisesRegex(fw.FirewallError, "Unexpected answer"):
+                fw.mcp_report(self.user, "research")
+
+    def test_registry_and_transactions_cover_mcp_firewalls(self):
+        record = {"user": "hermes", "ipv6": False, "subnet": "172.31.240.0/28", "dns": []}
+        data = {**registry("research"), "mcp": {"research/github": record}}
+        fw.validate_registry(data)
+        self.assertEqual(fw.targets(data), ["research", "research/github"])
+        text = fw.refresh_transaction(data, {"research": {}, "research/github": {"allow_ports_v4": ["1.2.3.4/32 . tcp . 443"]}})
+        self.assertIn(f"add element inet {fw.identity('research/github')['table']} allow_ports_v4", text)
+        for bad in ({**registry(), "mcp": {"research": record}}, {**registry(), "mcp": {"r/x": {**record, "label": ""}}},
+                    {**registry(), "mcp": []}):
+            with self.subTest(bad=bad), self.assertRaises(fw.FirewallError):
+                fw.validate_registry(bad)
+        fw.validate_registry(registry("research"))  # registries from before MCP firewalls stay valid
+
+    def test_mcp_firewalls_have_no_leases_and_no_sudo_rules(self):
+        record = {"user": "hermes", "ipv6": False, "subnet": "172.31.240.0/28", "dns": []}
+        data = {**registry("research"), "mcp": {"research/github": record}}
+        self.assertNotIn("github", fw.sudoers_text(data))
+        for call in (lambda: fw.open_lease(data, "research/github", []), lambda: fw.close_lease(data, "research/github", []),
+                     lambda: fw.remove_profile(data, "research/github")):
+            with self.assertRaisesRegex(fw.FirewallError, "never opens"):
+                call()
+        with self.assertRaisesRegex(fw.FirewallError, "profile name"):
+            fw.add_profile(data, "research/github", self.user)
 
 
 class StateFileTests(unittest.TestCase):

@@ -12,6 +12,9 @@ ipv6 = "auto"
 # if other important containers run here, and watch 'hermes-firewall status'.
 docker_requires_firewall = true
 
+# MCP firewalls take a /28 each from this private range (at most 256 of them).
+# mcp_subnet = "172.31.240.0/20"
+
 [lease]
 default = "1h"     # "open PROFILE" without a duration
 max = "24h"        # longest lease, also for /firewall in Hermes (at most 24h)
@@ -43,3 +46,13 @@ egress_proxy = true
 #
 # [[allow]]
 # net = "203.0.113.0/24"     # a package mirror
+
+# MCP servers that Hermes starts with "docker run": one locked network per server.
+# They never open and reach only this list, on the ports named here, or nothing
+# with allow = []. A name (host) also gives this server the DNS servers above.
+# Then: sudo hermes-firewall mcp add PROFILE SERVER
+#
+# [[mcp]]
+# profile = "default"
+# server = "github"
+# allow = [{ host = "api.github.com", tcp = [443] }, { net = "140.82.112.0/20", tcp = [443] }]

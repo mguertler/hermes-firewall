@@ -10,7 +10,7 @@ shellcheck install.sh uninstall.sh tests/*.sh
 
 The unit tests include a fuzz test of the sudo surface: 3,000 random argument sequences behind `open P` and `close P` (fixed seed) must each be a valid lease request or fail without changing anything.
 
-`tests/netns.sh` runs in a private user + network namespace: the namespace plays the Hermes host (router + firewall, docker0 with an egress proxy), with a sandbox, a LAN and an Internet namespace, IPv4 and IPv6. It loads the generated rules with nft and checks 24 targets in the states closed / lan / internet / all / closed again: LAN hosts, the public address of a LAN host, Internet, DNS (IPv4 and IPv6), `[[allow]]` address and network, other private networks, the host itself, the egress proxy, IPv6 ULA and global LAN prefixes, NAT64 (public, LAN and private embedded addresses) and 6to4. Blocked targets must be refused at once: a timeout counts as a failure. It must pass after every rule change. A quick mutation check (e.g. let `nat64()` return `[]`) shows that it catches bypasses.
+`tests/netns.sh` runs in a private user + network namespace: the namespace plays the Hermes host (router + firewall, docker0 with an egress proxy), with a sandbox, a LAN and an Internet namespace, IPv4 and IPv6. It loads the generated rules with nft and checks 24 targets in the states closed / lan / internet / all / closed again: LAN hosts, the public address of a LAN host, Internet, DNS (IPv4 and IPv6), `[[allow]]` address and network, other private networks, the host itself, the egress proxy, IPv6 ULA and global LAN prefixes, NAT64 (public, LAN and private embedded addresses) and 6to4. Then it loads the rules of an MCP firewall, once with a list of addresses and once with a name, and checks 16 targets: only the listed address and port, DNS only for the name. Blocked targets must be refused at once: a timeout counts as a failure. It must pass after every rule change. A quick mutation check (e.g. let `nat64()` return `[]`) shows that it catches bypasses.
 
 The CI workflow (`.github/workflows/ci.yml`) runs all three on Ubuntu.
 
@@ -61,7 +61,8 @@ Not covered automatically; record the result (distribution, versions, date) belo
 6. Hermes egress proxy (`hermes egress setup/start`, `proxy.enforce_on_docker false`): reachable from the sandbox in every state, other host ports and its management port not.
 7. `sudo ./install.sh` again (upgrade) keeps leases open; `uninstall.sh` and `--purge`.
 8. What the agent is told, in a real Hermes session: `/context` or `HERMES_DUMP_REQUESTS=true` shows the rule once in the system prompt with `prompt_rule` on and not with it off; with `status_line` on, every user message carries the current state, also after `/firewall open` and after a lease ran out.
-9. Distributions: Debian 13, Ubuntu 24.04, Fedora, Arch, openSUSE (install, add, open, close).
+9. MCP firewall, with a small MCP server in `docker run -i`: `mcp scan` names all kinds of servers; `mcp add` writes only the own entries after `run` and keeps `${VAR}` in `config.yaml`; only the listed targets and ports work, for addresses and names; a list of only addresses gets no DNS; `hermes mcp test SERVER` starts it; after a reboot it works the same; `mcp remove` leaves `--network=none`; `remove PROFILE` and `uninstall` refuse while it exists.
+10. Distributions: Debian 13, Ubuntu 24.04, Fedora, Arch, openSUSE (install, add, open, close).
 
 ## Results
 
@@ -82,6 +83,11 @@ Not covered automatically; record the result (distribution, versions, date) belo
 | 2026-10-27 | agent notice: off = untouched output; on = one line on curl timeout with closed firewall, model (ministral-3:8b) then asks for `/firewall open`; needs a fresh gateway after plugin updates | test VM | pass |
 | 2026-10-27 | reject instead of drop: netns.sh (all blocked targets refused at once) with nft 1.1.3 and nft 1.0.6 (Debian 12); real `health()` against loaded tables with both versions | local, rootless | pass |
 | 2026-11-05 | prompt rule and status line: unit tests, netns.sh, shellcheck; status file against real nft 1.1.3 (closed, open, expiry); Hermes interfaces checked against its source only | local, rootless | pass |
-| | live: rule and status line in a real Hermes session (manual 8) | | **not done yet** |
-| | live: reject on the test VM (integration.sh expects refusals and a reset on expiry) | | **not done yet** |
-| | a full provider request through iron-proxy (needs a real API key); manual 9 live on other distributions (containers: pass) | | **not done** |
+| 2026-10-27 | live: reject (integration.sh: refusals in 0.00s, reset on expiry; 50 parallel connects refused, no timeout; curl, git, ssh, wget, urllib fail at once, pip and npm only wait for their own retries) | test VM | pass |
+| 2026-11-05 | manual 8 (rule once in the frozen prompt, off = none; status line per message incl. after open and after expiry, older lines replayed unchanged, off = none) | test VM: Hermes 0.22.5, Docker 29.9.2, Ollama | pass |
+| 2026-11-05 | MCP firewall: unit tests, netns.sh (16 targets, addresses and name) | local, rootless, nft 1.1.3 | pass |
+| 2026-11-05 | manual 9 (scan of all kinds, add/remove, `${VAR}` kept, IPv4 + IPv6 targets and ports, names, DNS only for names, `hermes mcp test`, restored by refresh, fail closed without network, after a reboot, `--network=none` after remove) | test VM | pass |
+| 2026-11-05 | tests/distros.sh, now with the rules of an MCP firewall | Debian 12 (nft 1.0.6) and 13, Ubuntu 24.04, Fedora 42, Arch, openSUSE Tumbleweed | pass |
+| 2026-11-05 | manual 7 again (upgrade keeps tables; uninstall removes `/run/hermes-firewall`; reinstall) | test VM | pass |
+| | a model calling a firewalled MCP tool (qwen3:8b did not manage Hermes' deferred tools; `hermes mcp test` connects and lists them) | | **not done** |
+| | a full provider request through iron-proxy (needs a real API key); manual 10 live on other distributions (containers: pass) | | **not done** |

@@ -91,6 +91,49 @@ Blocked connections fail at once instead of timing out: TCP connections are refu
 
 The only exception for the host: the Hermes egress proxy (iron-proxy), if it runs. It runs on the host, outside the firewall, so in every state sandboxes reach what iron-proxy itself allows (its allow list of AI provider APIs). To combine both, Hermes must accept the firewall network: `hermes -p PROFILE config set proxy.enforce_on_docker false` (`add` says so; the proxy keeps protecting your API keys).
 
+## MCP servers in Docker
+
+The sandbox firewall does not cover MCP servers: Hermes starts them on the host, so a container started with `docker run` has the open network of any other container, whatever the sandbox's state. `hermes-firewall mcp` gives such a server a network of its own that is locked for good: no leases, no `/firewall`, only the targets and ports in its allow list.
+
+```text
+sudo hermes-firewall mcp scan PROFILE               what the profile's MCP servers can reach
+sudo hermes-firewall mcp add PROFILE SERVER         lock a server to its allow list
+sudo hermes-firewall mcp remove PROFILE SERVER      remove its firewall; the server then has no network
+```
+
+The allow list is in the root-owned `/etc/hermes-firewall/config.toml`, not in the Hermes configuration, and every target names its ports:
+
+```toml
+[[mcp]]
+profile = "default"
+server = "github"
+allow = [{ host = "api.github.com", tcp = [443] }, { net = "140.82.112.0/20", tcp = [443] }]
+
+[[mcp]]
+profile = "default"
+server = "filesystem"
+allow = []                      # reaches nothing at all
+```
+
+`mcp add` creates the network and puts `--network=hermes-mcp-PROFILE-SERVER` and `--dns=...` right after `run` in the server's `args`; everything else stays as it is. It applies when the server starts again: `/reload-mcp` in the chat, or restart the gateway. Changes to an allow list reach the firewall within 5 minutes (or with `sudo hermes-firewall refresh`).
+
+What `mcp scan` finds and what happens to it:
+
+| The server in the Hermes configuration | `mcp add` |
+|---|---|
+| `command: docker`, `args: [run, ...]` | Sets it up completely |
+| Its `args` use `${VAR}`, or it starts Docker another way (`docker compose`, a shell, Podman) | Creates the network and tells you what to add yourself, because Hermes hands out `${VAR}` already expanded and writing that back would put secrets into the file |
+| `--network=...` of its own, `--privileged`, `docker.sock`, `DOCKER_HOST` | Refuses and says why |
+| `url:` (HTTP), or a command that runs on the host (`npx`, `uvx`, ...) | Refuses: no container for this firewall to lock |
+
+Limits you should know:
+
+- It is not enforced. Anyone who can use Docker can start a container without this network, so it protects against a compromised MCP server, not against the Hermes user. `status` and the 5-minute timer warn about Docker MCP servers without a firewall, in the journal for the timer.
+- MCP servers from Hermes plugins are not in `mcp_servers`, so `mcp scan` does not see them. A server of the same name in `mcp_servers` takes their place, and that one can be locked.
+- Names are only as exact as IP addresses. The firewall opens the addresses a name resolves to (all seen in the last 24 hours, checked every 5 minutes), which on a CDN also reaches other services on the same address. A brand-new address is refused until the next check.
+- A server with a name in its list also gets DNS, so it could leak small amounts of data through DNS queries. A list of only addresses gets no DNS at all, and a lookup there fails after about 5 seconds, so use addresses in that server's own settings.
+- The host itself stays blocked, even if its address is in the list.
+
 ## Settings
 
 `/etc/hermes-firewall/config.toml` is written once by the installer (with the DNS servers it found) and never overwritten by upgrades. After changing it run `sudo hermes-firewall refresh` (it happens every 5 minutes anyway; open leases stay open). All settings, with comments: [config.example.toml](config.example.toml).

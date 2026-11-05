@@ -9,7 +9,7 @@ hermes-firewall puts the Docker sandbox of each Hermes Agent profile behind its 
 /usr/local/share/hermes-firewall/plugin/  plugin source that `add` copies into profiles
 /etc/hermes-firewall/config.toml          settings (admin-owned, never overwritten)
 /etc/hermes-firewall/profiles.json        registry of protected profiles
-/etc/hermes-firewall/resolved.json        last addresses of lan.hosts and DNS64 prefixes that resolved
+/etc/hermes-firewall/resolved.json        last addresses of lan.hosts, DNS64 prefixes and MCP allow-list names that resolved
 /etc/sudoers.d/hermes-firewall            NOPASSWD open/close/status per protected profile
 /etc/systemd/system/hermes-firewall.service           restore at boot (all closed)
 /etc/systemd/system/hermes-firewall-refresh.{service,timer}   every 5 minutes
@@ -78,12 +78,29 @@ Hermes reuses long-lived containers (`container_persistent: true`); its reuse ch
 ## Commands
 
 - `add PROFILE`: checks (as the user), creates table (persist registry, load rules closed) and only then the Docker network, attaches the profile, writes sudoers, protects existing sandboxes. Running it again repairs network, profile and sandboxes.
+- `mcp scan|add|remove`: see [MCP firewalls](#mcp-firewalls). `remove PROFILE` refuses while the profile has MCP firewalls.
 - `remove PROFILE`: detaches the profile, disconnects containers from the network, removes the network, then the table, registry entry and sudoers line.
 - `open|close PROFILE ...`: lease transactions; `status`: health, sandboxes, leases.
 - `restore` (boot): all tables in one transaction, all closed.
 - `refresh` (timer): restores missing tables (closed), replaces all address sets in one transaction (strict: on a resolution failure nothing changes), re-attaches profiles whose DNS servers changed, protects sandboxes. Every step runs even if another failed; failures are reported at the end (exit code 1, journal).
 
 All root commands take the global lock; a command waits at most 2 minutes for it.
+
+## MCP firewalls
+
+Hermes starts MCP servers on the host (`mcp_servers.NAME`: `command` + `args`, or `url`), so the sandbox firewall does not cover them, and Hermes knows no MCP containers: `docker run` is simply the command. A firewall exists per server per profile, named `PROFILE/SERVER`. `identity("PROFILE/SERVER")` gives it its own bridge, table (same `hermes_fw_` prefix) and IPv6 subnet, and the network `hermes-mcp-PROFILE-SERVER`; a name clash fails the ownership check of `check_network`. Registry: `"mcp": {"PROFILE/SERVER": {"user", "ipv6", "subnet", "dns"}}` beside `profiles`, optional, so older registries stay valid. `targets(data)` lists both kinds for `restore`, `refresh`, `upgrade` and `uninstall`.
+
+The rules are the same chains as for a profile (`rules`, `health`, `layout`). What makes it locked is what is missing: `mcp_sets` fills only `allow_ports_v4/v6` and, for a list with names, the DNS sets. The lease sets stay empty because nothing can fill them: `record_of` refuses `PROFILE/SERVER`, so `open` and `close` fail, and sudoers has no rule for them. A server is reached over stdio through `docker run -i`, so no traffic has to enter the network.
+
+The allow list is `[[mcp]]` in `config.toml` (root-owned), and every entry must name ports (`mcp_servers_config`). `mcp_addresses` resolves names against the sandbox DNS servers and keeps every address seen in the last `MCP_ADDRESS_KEEP` seconds in `resolved.json`, because services rotate addresses and the container may get another answer than the firewall. A failed lookup keeps what is known; a name that never resolved allows nothing. So a lookup failure never blocks a refresh of the other firewalls, unlike `lan.hosts`, where a missing address would widen an Internet lease.
+
+DNS: a list of only addresses gets `--dns=192.0.2.1` (`NO_DNS`, a documentation address) and no DNS rule. The option is needed: without `--dns`, Docker's embedded resolver answered from the host's side, past the table (seen live on Docker 29). Every failing `--dns` value makes a lookup take about 5 seconds; that is Docker's resolver, not the rules.
+
+Subnets: `free_subnet` hands out a /28 from `mcp_subnet`, skipping what the registry, Docker networks and host routes use, because Docker's default pools only last for about 30 networks.
+
+As the Hermes user: `_hermes mcp-scan PROFILE` reads `hermes config get mcp_servers --json --raw` and reports `{name, state, text}` for each server (`mcp_state`); root validates that report and only prints it (`mcp_report`). `_hermes mcp-attach` puts the own entries right after `run` (`own_mcp_args` finds them again) with `hermes config set mcp_servers.NAME.args JSON` and reads the value back. `config get` returns `${VAR}` already expanded (and masks secrets without `--raw`), so writing it back could put a secret into the file. Arguments are therefore only written when each of them is found literally in `config.yaml`; otherwise the state is `manual`: the network is created and the user gets a hint. `_hermes mcp-detach` replaces the entries with `--network=none`, so a server never ends up unfiltered. A server that still names a removed network fails to start.
+
+`mcp_warnings` (at `add`, in `status` and `refresh`) reports Docker MCP servers without a firewall. It cannot enforce anything: whoever can use Docker can start containers elsewhere.
 
 ## Plugin and sudoers
 
@@ -94,8 +111,8 @@ All root commands take the global lock; a command waits at most 2 minutes for it
 - `hermes-firewall.service` (oneshot, `RemainAfterExit`, no `ExecStop`) runs `restore`; ordered after nftables/firewalld/ufw and before Docker. The Docker drop-in (`docker_requires_firewall = true`) makes Docker fail closed if it fails. The refresh timer does not depend on the service, so it also repairs a failed boot restore.
 - `install.sh` copies the files to a private temporary directory and runs `hermes_firewall.py --bundle=DIR install` (or `upgrade` if `profiles.json` exists). `install` must not start the service itself (its ExecStart would wait for the lock); `install.sh` starts it afterwards.
 - `upgrade` writes program, plugin source, units and sudoers, reloads all tables only if `health()` fails (rule layout changed: all leases close), otherwise refreshes, and re-attaches every profile (new plugin, DNS).
-- `uninstall` refuses while profiles, package networks or tables exist; keeps `config.toml` unless `--purge`.
+- `uninstall` refuses while profiles, MCP firewalls, package networks or tables exist; keeps `config.toml` unless `--purge`.
 
 ## Known limits
 
-Lease timeouts do not run while the host is suspended (kernel timers); until the next refresh after a resume, the status line may call a lease closed that still runs. NAT64 prefixes other than /96 and prefixes announced only by the router (PREF64) are not detected. LAN parts that are not directly connected (e.g. other /64s of a delegated prefix) and router hairpin NAT must be configured. After `flush ruleset` by another tool, sandboxes are unfiltered until the next refresh (at most 5 minutes). Profile names are global per host (one registry), even with several Hermes users.
+MCP servers from Hermes plugins are not in `mcp_servers` and stay unseen by `mcp scan`; MCP servers over HTTP are not covered. Lease timeouts do not run while the host is suspended (kernel timers); until the next refresh after a resume, the status line may call a lease closed that still runs. NAT64 prefixes other than /96 and prefixes announced only by the router (PREF64) are not detected. LAN parts that are not directly connected (e.g. other /64s of a delegated prefix) and router hairpin NAT must be configured. After `flush ruleset` by another tool, sandboxes are unfiltered until the next refresh (at most 5 minutes). Profile names are global per host (one registry), even with several Hermes users.

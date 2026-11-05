@@ -22,7 +22,9 @@ fw = importlib.util.module_from_spec(spec); spec.loader.exec_module(fw)
 sets = {"lan_v4": ["192.168.0.0/24"], "lan_v6": ["fd00::/64"], "dns_v4": ["192.168.0.5"],
         "allow_ports_v4": ["192.168.0.2/32 . tcp . 8088"], "non_public_v6": list(fw.NONPUBLIC_V6),
         "host_ports_v4": ["172.17.0.1 . tcp . 9090"]}
-open("/tmp/rules.nft", "w").write(fw.rules("distro-check", sets) + fw.lease_transaction("distro-check", fw.KINDS, 60))
+mcp = {"dns": ["192.168.0.5"], "mcp": {"distro/check": [{"net": "1.2.3.0/24", "tcp": [443], "udp": [53]}, {"net": "2001:4860::/32", "tcp": [443], "udp": []}]}}
+open("/tmp/rules.nft", "w").write(fw.rules("distro-check", sets) + fw.lease_transaction("distro-check", fw.KINDS, 60)
+                                  + fw.rules("distro/check", fw.mcp_sets(mcp, "distro/check", {})))
 open("/tmp/sudoers", "w").write(fw.sudoers_text({"version": 2, "profiles": {"distro-check": {
     "user": "root", "ipv6": False, "label": "distro-check", "dns": []}}}))
 PY

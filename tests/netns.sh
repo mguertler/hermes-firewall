@@ -41,6 +41,12 @@ for name, kinds in (("lan", ("lan",)), ("internet", ("internet",)), ("all", fw.K
     (out / f"open-{name}.nft").write_text(fw.lease_transaction("netns-test")
                                           + fw.lease_transaction("netns-test", kinds, 600))
 (out / "closed.nft").write_text(fw.lease_transaction("netns-test"))
+# MCP firewalls: the same chains, but only the allow list, with ports; DNS only for names.
+mcp = {**conf, "mcp": {"netns-test/ips": [{"net": "203.0.113.50/32", "tcp": [80], "udp": []},
+                                          {"net": "2606:4700::10/128", "tcp": [80], "udp": []}],
+                       "netns-test/names": [{"host": "lanhost.test", "tcp": [80], "udp": []}]}}
+for name in ("ips", "names"):
+    (out / f"mcp-{name}.nft").write_text(fw.rules("netns-test", fw.mcp_sets(mcp, f"netns-test/{name}", fw.mcp_addresses(mcp))))
 item = fw.identity("netns-test")
 print(item["bridge"], item["subnet6"].split("::")[0])
 PY
@@ -184,6 +190,45 @@ for state in closed open-lan open-internet open-all closed; do
         printf '%-14s FAIL: %s\n' "$state" "${wrong[*]}"; failed=1
     else
         printf '%-14s ok (%d targets)\n' "$state" "${#expected_list[@]}"
+    fi
+done
+
+# name  target  expected with the allow list: of IP addresses  of a name
+mcp_matrix="
+allowed-ip     tcp 203.0.113.50 80          o -
+other-port     tcp 203.0.113.50 53          - -
+allowed-ip6    tcp 2606:4700::10 80         o -
+allowed-name   tcp 93.184.1.7 80            - o
+name-otherport tcp 93.184.1.7 53            - -
+dns-udp        udp 192.168.0.5 53           - o
+dns-tcp        tcp 192.168.0.5 53           - o
+dns6           udp 2606:4700:4700::1111 53  - o
+public-dns     udp 9.9.9.9 53               - -
+lan-host       tcp 192.168.0.10 80          - -
+lan-allow      tcp 192.168.0.2 8088         - -
+internet       tcp 93.184.0.10 80           - -
+internet6      tcp 2001:db8:ff::10 80       - -
+nat64-public   tcp 64:ff9b::5db8:a 80       - -
+host-bridge    tcp 172.30.0.1 80            - -
+egress-proxy   tcp 172.17.0.1 9090          - -
+"
+targets=$(awk 'NF {print $1, $2, $3, $4}' <<< "$mcp_matrix")
+for state in ips names; do
+    column=$([[ $state == ips ]] && echo 5 || echo 6)
+    "$NFT" -f "$work/mcp-$state.nft"
+    sleep 2  # the kernel limits ICMP errors per destination; earlier rounds used up the allowance
+    expected=$(awk -v c="$column" 'NF {print ($c == "o" ? "open" : "blocked")}' <<< "$mcp_matrix" | tr '\n' ' ')
+    got=$(ns "$sandbox" python3 -I "$work/probe.py" <<< "$targets")
+    read -ra got_list <<< "$got"; read -ra expected_list <<< "$expected"
+    wrong=()
+    for i in "${!expected_list[@]}"; do
+        [[ ${got_list[i]} == "${expected_list[i]}" ]] \
+            || wrong+=("$(awk -v n=$((i + 1)) 'NF && ++k == n {print $1}' <<< "$mcp_matrix")=${got_list[i]}")
+    done
+    if ((${#wrong[@]})); then
+        printf 'mcp-%-10s FAIL: %s\n' "$state" "${wrong[*]}"; failed=1
+    else
+        printf 'mcp-%-10s ok (%d targets)\n' "$state" "${#expected_list[@]}"
     fi
 done
 exit "$failed"
