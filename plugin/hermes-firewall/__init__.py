@@ -39,6 +39,7 @@ NETWORK_ERROR = re.compile(
     r"Connection refused|ECONNREFUSED|Connection reset by peer|ECONNRESET|"
     r"unable to access '[^']*': Failed to connect", re.I)
 CURL_NETWORK_EXIT = {6, 7, 28, 35, 56}  # resolve, connect, timeout, TLS connect, receive
+WGET_NETWORK_EXIT = 4  # also the only sign of a failure with wget -q, which prints nothing
 
 
 def profile_name():
@@ -89,6 +90,8 @@ def network_failure(command, output, returncode):
     if LOCAL.search(command or "") or LOCAL.search(output or ""):
         return False  # a local service inside the sandbox, not the firewall
     if returncode in CURL_NETWORK_EXIT and re.search(r"\bcurl\b", command or ""):
+        return True
+    if returncode == WGET_NETWORK_EXIT and re.search(r"\bwget\b", command or ""):
         return True
     return bool(NETWORK_ERROR.search(output or ""))
 
